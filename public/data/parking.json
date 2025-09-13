@@ -1,0 +1,8 @@
+{
+  "totalSpots": 4,
+  "dates": [
+    { "date": "2025-09-12", "booked": 2 },
+    { "date": "2025-09-13", "booked": 4 },
+    { "date": "2025-09-14", "booked": 1 }
+  ]
+}

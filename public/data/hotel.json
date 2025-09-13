@@ -1,0 +1,85 @@
+{
+  "name": "CHILL Apartments",
+  "address": "Sokolská 1614/64, Praha 2",
+  "city": "Prague",
+  "checkIn": "14:00",
+  "checkOut": "11:00",
+
+  "houseRules": {
+    "noSmokingFineEur": 100,
+    "noOpenFire": true,
+    "tv": "Smart TV (no channels)",
+    "ac": "Sun = heating, Snowflake = cooling",
+    "laundry": "Basement laundry, free, 24/7"
+  },
+
+  "gateCode": "3142#",
+  "luggageCode": "3142#",
+
+  "boxes": {
+    "functional": {
+      "1": "1421#",
+      "2": "1432#",
+      "3": "1443#",
+      "4": "1454#",
+      "5": "1465#",
+      "6": "1476#",
+      "8": "2432#",
+      "9": "2443#",
+      "10": "2454#",
+      "11": "2465#"
+    },
+    "disabled": [7, 12]
+  },
+
+  "parking": {
+    "totalSpots": 4,
+    "priceEurPerNight": 20,
+    "altUrl": "https://www.mrparkit.com",
+    "weekendFreeTips": "From Friday 20:00 till Monday 8:00 you can park for free on I.P. Pavlova 1–3 (≈50 m).",
+    "narrowPassage": "Passage height 220 cm, width 220 cm.",
+    "photos": {
+      "entry": "/img/parking-entry.jpg"
+    }
+  },
+
+  "transfer": {
+    "smallEur": 31,
+    "smallCzk": 750,
+    "largeEur": 42,
+    "largeCzk": 1000,
+    "note": "Small = up to 4 people; Large = 5–8 or much luggage",
+    "driverPhone": "+420722705919",
+    "confirmationSmall": "I arranged the pick up for you. The driver will be waiting in the arrival hall with your name on a sign. In case you can’t find each other, please call this number: +420722705919. The price is 31 EUR or 750 CZK, payment to the driver in cash or card. Have a safe journey!",
+    "confirmationLarge": "I arranged the pick up for you. The driver will be waiting in the arrival hall with your name on a sign. In case you can’t find each other, please call this number: +420722705919. The price is 42 EUR or 1000 CZK, payment to the driver in cash or card."
+  },
+
+  "wifi": [
+    { "apartment": "202", "floor": 2, "ssid": "CHILL-202", "pass": "********" },
+    { "apartment": "203", "floor": 2, "ssid": "CHILL-203", "pass": "********" }
+  ],
+
+  "links": {
+    "matterport": "https://my.matterport.com/show/?m=PTEAUeUbMno",
+    "breakfast": {
+      "place": "La Mouka",
+      "discount": "10% with code CHILL",
+      "note": "Open from 9:00, around the corner"
+    },
+    "photos": {
+      "gate": "/img/gate.jpg",
+      "luggage": "/img/luggage.jpg",
+      "keybox": "/img/keybox.jpg",
+      "sensor": "/img/sensor.jpg"
+    }
+  },
+
+  "templates": {
+    "welcome": "Thank you for choosing CHILL Apartments! Check-in is from 14:00 and check-out is by 11:00. Parking is limited (20 €/night) — let us know ASAP if you need a spot. I can also arrange an airport pick-up: 31 € (≤4p) or 42 € (5–8p).",
+    "parking_full": "Our parking is fully booked for your dates. Please try www.mrparkit.com. Tip: From Friday 20:00 till Monday 8:00 there is free parking at I.P. Pavlova 1–3 (≈50 m).",
+    "ac_help": "If AC doesn’t work, check the mode first (Sun = heating, Snowflake = cooling). If the green light is flashing, please restart it: on the 2nd-floor balcony switch off your apartment’s AC breaker for ~30 seconds and turn it back on.",
+    "house_rules": "All rooms are strictly non-smoking (100 € fine). No open fire. TV is Smart TV (no channels). You can use balconies and the courtyard. Laundry room: basement, free, 24/7.",
+    "checkout": "Check-out is before 11:00. Please drop the key into the white postal box on the ground floor opposite the elevator.",
+    "checkout_with_parking": "Check-out is before 11:00. Please leave the parking fee (20 €/night) in the apartment and drop the key into the white postal box on the ground floor opposite the elevator."
+  }
+}
