@@ -1,15 +1,14 @@
 // netlify/functions/parking.ts
 // REST endpoint pro přímé požadavky na parkování (mimo chat UI).
-// - parsuje datumy (15–17.8. atd.) přes sdílený parser
-// - doptá "tento měsíc / příští rok", když je třeba
+// - parsuje datumy přes sdílený parser
+// - doptá "tento měsíc / příští rok"
 // - čte dostupnost a zapisuje rezervaci přes Apps Script (SHEETS_API_URL nebo fallback)
 // - pokud dostane guest.name + guest.car_plate (+ volitelně guest.email), zapíše a Apps Script může poslat instrukce
 
+export const config = { runtime: 'node' };
+
 import type { Range } from '../../src/lib/date';
 import { parseDatesSmart, resolveFromChoice } from '../../src/lib/date';
-
-// Nutíme Node runtime (kvůli process.env)
-export const config = { runtime: 'node' as const };
 
 // Tvůj Apps Script EXEC URL – bezpečný fallback, když není env
 const SHEETS_URL_FALLBACK =
@@ -19,7 +18,7 @@ const SHEETS_URL_FALLBACK =
 const SHEETS_API_URL: string =
   (`${process.env.SHEETS_API_URL ?? ''}`).trim() || SHEETS_URL_FALLBACK;
 
-// Volitelně ověř formát URL už při startu
+// Validace URL při startu
 try { new URL(SHEETS_API_URL); } catch { throw new Error('Invalid SHEETS_API_URL (env + fallback)'); }
 
 export default async (req: Request) => {
@@ -38,7 +37,7 @@ export default async (req: Request) => {
       const url = new URL(SHEETS_API_URL);
       Object.entries(params || {}).forEach(([k, v]) => url.searchParams.set(k, String(v)));
       const r = await fetch(url.toString());
-      if (!r.ok) throw new Error(`Sheets GET ${r.status}`);
+      if (!r.ok) throw new Error(`Sheets GET ${r.status} ${await r.text().catch(()=> '')}`);
       return await r.json();
     };
     const gsPost = async (payload: any) => {
@@ -47,7 +46,7 @@ export default async (req: Request) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload || {})
       });
-      if (!r.ok) throw new Error(`Sheets POST ${r.status}`);
+      if (!r.ok) throw new Error(`Sheets POST ${r.status} ${await r.text().catch(()=> '')}`);
       return await r.json();
     };
 
@@ -59,7 +58,6 @@ export default async (req: Request) => {
     let range: Range | null = parsed.confirmed;
 
     if (!range && parsed.ask && !choice) {
-      // potřebujeme od uživatele volbu (tento měsíc / příští rok)
       return new Response(JSON.stringify({ ok: true, needChoice: true, message: parsed.ask }), {
         status: 200, headers: { 'content-type': 'application/json' }
       });
@@ -101,8 +99,10 @@ export default async (req: Request) => {
         channel: 'Direct',
         arrival_time: guest.arrival_time || '',
         note: guest.note || '',
-        guest_email: guest.email || '' // Apps Script může poslat instrukce
+        guest_email: guest.email || ''
       };
+      // DEBUG
+      console.log('reserveParking payload:', payload);
       const r = await gsPost(payload);
       if (r && r.ok && r.id) {
         wrote = { id: String(r.id) };

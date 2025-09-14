@@ -1,7 +1,7 @@
 // netlify/functions/chat.js
 // Chat funkce – jednotný parser dat, TOOL protokol pro čtení/zápis do Sheets,
-// deterministické doptání „tento měsíc / příští rok“, fallback na Apps Script URL,
-// OPENAI_API_KEY z ENV. Běží v Node runtime.
+// deterministické doptání „tento měsíc / příští rok“ (funguje i bez diakritiky),
+// fallback na Apps Script URL, OPENAI_API_KEY z ENV. Běží v Node runtime.
 
 export const config = { runtime: 'node' };
 
@@ -23,7 +23,7 @@ export default async (req) => {
     const { messages = [] } = body;
 
     // ---- ENV ----
-    const OPENAI_API_KEY = (`${process.env.OPENAI_API_KEY ?? ''}`).trim(); // nastav v Netlify env
+    const OPENAI_API_KEY = (`${process.env.OPENAI_API_KEY ?? ''}`).trim();
     const SHEETS_API_URL = (`${process.env.SHEETS_API_URL ?? ''}`).trim() || SHEETS_URL_FALLBACK;
 
     if (!OPENAI_API_KEY) return new Response('Missing OPENAI_API_KEY', { status: 500 });
@@ -48,7 +48,7 @@ export default async (req) => {
       const url = new URL(SHEETS_API_URL);
       Object.entries(params || {}).forEach(([k, v]) => url.searchParams.set(k, v));
       const r = await fetch(url.toString());
-      if (!r.ok) throw new Error(`Sheets GET ${r.status} ${await r.text().catch(()=>'')}`);
+      if (!r.ok) throw new Error(`Sheets GET ${r.status} ${await r.text().catch(()=> '')}`);
       return await r.json();
     }
     async function gsPost(payload) {
@@ -57,7 +57,7 @@ export default async (req) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload || {})
       });
-      if (!r.ok) throw new Error(`Sheets POST ${r.status} ${await r.text().catch(()=>'')}`);
+      if (!r.ok) throw new Error(`Sheets POST ${r.status} ${await r.text().catch(()=> '')}`);
       return await r.json();
     }
 
@@ -101,7 +101,7 @@ export default async (req) => {
       });
     }
 
-    // 2) Uživatel odpověděl „tento měsíc / příští rok“ (i bez diakritiky)
+    // 2) Uživatel odpověděl „tento měsíc / příští rok“ (funguje i bez diakritiky)
     if (!confirmedRange && !parsed.ask) {
       const askText = findLastAskText(messages);
       if (askText) {
@@ -129,7 +129,7 @@ https://my.matterport.com/show/?m=PTEAUeUbMno
 If you have any questions, please do not hesitate to ask.
 `.trim();
 
-    // ---- Pravidla pro AI (TOOL protokol zůstává) ----
+    // ---- Pravidla pro AI (TOOL protokol) ----
     const rules = `
 You are a multilingual, precise assistant for ${HOTEL.name} (${HOTEL.address}, ${HOTEL.city}).
 Reply in the user's language. Never invent facts.
@@ -202,6 +202,8 @@ ${confirmedRange ? `PARSED_RANGE: ${JSON.stringify(confirmedRange)}` : ''}
         try { payload = JSON.parse(json); } catch { result = { ok:false, error:'Bad JSON for reserveParking' }; }
         if (!result) {
           payload.fn = 'reserveParking';
+          // DEBUG log (uvidíš v Netlify logu přes "Functions > logs")
+          console.log('reserveParking payload:', payload);
           result = await gsPost(payload);
           wrote = true;
         }
@@ -210,7 +212,6 @@ ${confirmedRange ? `PARSED_RANGE: ${JSON.stringify(confirmedRange)}` : ''}
         result = { ok:false, error:'unknown tool cmd' };
       }
 
-      // Pokud šlo o zápis a OK → deterministická odpověď s ID + instrukce
       if (wrote && result && result.ok && result.id) {
         const price = HOTEL.parking?.priceEurPerNight || 20;
         const final = [
@@ -223,7 +224,6 @@ ${confirmedRange ? `PARSED_RANGE: ${JSON.stringify(confirmedRange)}` : ''}
         });
       }
 
-      // Jinak předej výsledek AI a nech ji dokončit
       const toolMsg = { role: 'system', content: `TOOL-RESULT: ${JSON.stringify(result)}` };
       ai = await callOpenAI([...seed, ...messages, toolMsg]);
     }
