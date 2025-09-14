@@ -1,9 +1,15 @@
 // netlify/functions/chat.js
-// Kompletní verze s opravou:
-// - Lepší parser rozsahů (15–17. 8, od 15 do 17.8., 15.–17. apod.)
-// - Rozlišení "tento měsíc" vs "příští rok" z předchozí doptávací zprávy asistenta
-// - Přednačtení dostupnosti ze Sheets a deterministická potvrzovací odpověď s ID + instrukcemi
-// Vyžaduje: env OPENAI_API_KEY, SHEETS_API_URL (Apps Script v3 /exec)
+// Chat funkce – jednotný parser dat, TOOL protokol pro čtení/zápis do Sheets,
+// deterministické doptání „tento měsíc / příští rok“, fallback na Apps Script URL,
+// OPENAI_API_KEY z ENV. Běží v Node runtime.
+
+export const config = { runtime: 'node' };
+
+import { parseDatesSmart, resolveFromChoice } from '../../src/lib/date';
+
+// Apps Script EXEC URL – fallback, pokud není SHEETS_API_URL v env
+const SHEETS_URL_FALLBACK =
+  'https://script.google.com/macros/s/AKfycbzwiAqnD3JOMkMhNG4mew0zCsEp-ySA8WBgutQ38n6ZkF15SBVGU_no6gCPJqPnRAcohg/exec';
 
 export default async (req) => {
   try {
@@ -17,10 +23,11 @@ export default async (req) => {
     const { messages = [] } = body;
 
     // ---- ENV ----
-    const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-    const SHEETS_API_URL = process.env.SHEETS_API_URL;
+    const OPENAI_API_KEY = (`${process.env.OPENAI_API_KEY ?? ''}`).trim(); // nastav v Netlify env
+    const SHEETS_API_URL = (`${process.env.SHEETS_API_URL ?? ''}`).trim() || SHEETS_URL_FALLBACK;
+
     if (!OPENAI_API_KEY) return new Response('Missing OPENAI_API_KEY', { status: 500 });
-    if (!SHEETS_API_URL) return new Response('Missing SHEETS_API_URL', { status: 500 });
+    try { new URL(SHEETS_API_URL); } catch { return new Response('Invalid SHEETS_API_URL', { status: 500 }); }
 
     // ---- Načti hotel.json ----
     const base = new URL(req.url);
@@ -41,7 +48,7 @@ export default async (req) => {
       const url = new URL(SHEETS_API_URL);
       Object.entries(params || {}).forEach(([k, v]) => url.searchParams.set(k, v));
       const r = await fetch(url.toString());
-      if (!r.ok) throw new Error(`Sheets GET ${r.status}`);
+      if (!r.ok) throw new Error(`Sheets GET ${r.status} ${await r.text().catch(()=>'')}`);
       return await r.json();
     }
     async function gsPost(payload) {
@@ -50,110 +57,23 @@ export default async (req) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload || {})
       });
-      if (!r.ok) throw new Error(`Sheets POST ${r.status}`);
+      if (!r.ok) throw new Error(`Sheets POST ${r.status} ${await r.text().catch(()=>'')}`);
       return await r.json();
     }
 
-    // ---- Date utils ----
+    // ---- Util ----
     const toISODate = (d) => d.toISOString().slice(0, 10);
-    const fmtISO    = (y,m,d) => `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
-    const daysInMonth = (y,m) => new Date(y, m, 0).getDate();
-    const clampDay = (y,m,d) => Math.min(d, daysInMonth(y,m));
 
-    // ---- Parser: chytá různé tvary rozsahů ----
-    function parseDatesSmart(text) {
-      const now = new Date();
-      const CY = now.getFullYear();
-      const CM = now.getMonth() + 1;
-
-      const t = (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
-
-      // 1) formát "od 15 do 17. 8. 2025" / "15–17.8.2025" / "15 - 17. 8"
-      // skupiny: d1, d2, mo?, y?
-      const reRange = /(?:od\s*)?(\d{1,2})\s*(?:-|–|až|do)\s*(\d{1,2})\s*[.\-/ ]*\s*(\d{1,2})?(?:[.\-/ ]*\s*(\d{2,4}))?/i;
-      let m = reRange.exec(t);
-      if (m) {
-        let d1 = parseInt(m[1],10);
-        let d2 = parseInt(m[2],10);
-        let mo = m[3] ? parseInt(m[3],10) : NaN;
-        let y  = m[4] ? String(m[4]) : null;
-        if (y && y.length === 2) y = (Number(y) > 50 ? '19' : '20') + y;
-        let Y = y ? parseInt(y,10) : NaN;
-
-        if (!Number.isFinite(Y)) Y = CY;
-        if (!Number.isFinite(mo)) mo = CM;
-
-        // pokud měsíc už proběhl a rok nebyl uveden → doptání
-        const hadYear = !!m[4];
-        if (!hadYear && mo < CM) {
-          const A2 = fmtISO(CY, CM, clampDay(CY, CM, d1));
-          const B2 = fmtISO(CY, CM, clampDay(CY, CM, d2));
-          const A1 = fmtISO(CY+1, mo, clampDay(CY+1, mo, d1));
-          const B1 = fmtISO(CY+1, mo, clampDay(CY+1, mo, d2));
-          return {
-            ask: `Zadal jste měsíc, který už proběhl. Myslíte spíš **${A2} až ${B2}** (tento měsíc), nebo **${A1} až ${B1}** (příští rok)? Odpovězte prosím "tento měsíc" nebo "příští rok", případně napište přesná data.`,
-            confirmed: null
-          };
-        }
-
-        const A = fmtISO(Y, mo, clampDay(Y, mo, d1));
-        const B = fmtISO(Y, mo, clampDay(Y, mo, d2));
-        const from = A <= B ? A : B;
-        const to   = A <= B ? B : A;
-        return { confirmed: { from, to }, ask: null };
-      }
-
-      // 2) formát "15. 8. 2025" (jedno datum) → from=to
-      const reSingle = /(\d{1,2})\s*[.\-/ ]\s*(\d{1,2})(?:[.\-/ ]\s*(\d{2,4}))?/i;
-      m = reSingle.exec(t);
-      if (m) {
-        let d = parseInt(m[1],10);
-        let mo = parseInt(m[2],10);
-        let y  = m[3] ? String(m[3]) : null;
-        if (y && y.length === 2) y = (Number(y) > 50 ? '19' : '20') + y;
-        let Y = y ? parseInt(y,10) : CY;
-
-        if (!m[3] && mo < CM) {
-          const A2 = fmtISO(CY, CM, clampDay(CY, CM, d));
-          const A1 = fmtISO(CY+1, mo, clampDay(CY+1, mo, d));
-          return {
-            ask: `Zadal jste měsíc, který už proběhl. Myslíte spíš **${A2}** (tento měsíc), nebo **${A1}** (příští rok)?`,
-            confirmed: null
-          };
-        }
-
-        const iso = fmtISO(Y, mo, clampDay(Y, mo, d));
-        return { confirmed: { from: iso, to: iso }, ask: null };
-      }
-
-      return { confirmed: null, ask: null };
+    // Najdi POSLEDNÍ doptávací zprávu asistenta s ISO páry (pro resolveFromChoice)
+    function findLastAskText(msgs) {
+      const m = [...msgs].reverse().find(
+        m => m.role === 'assistant' &&
+             /\*\*\d{4}-\d{2}-\d{2}\s+až\s+\d{4}-\d{2}-\d{2}\*\*/i.test(m.content)
+      );
+      return m?.content || null;
     }
 
-    // ---- Když uživatel odpoví "tento měsíc / příští rok", vezmeme předchozí doptávací větu asistenta ----
-    function resolveRangeFromAsk(allMessages, userText) {
-      const txt = (userText || '').toLowerCase();
-      const choice = txt.includes('tento měsíc') ? 'this' :
-                     txt.includes('pristi rok') || txt.includes('příští rok') ? 'next' : null;
-      if (!choice) return null;
-
-      // najdi poslední assistant zprávu, která obsahuje dvě ISO data ve formátu "**YYYY-MM-DD až YYYY-MM-DD**" dvakrát (this/next)
-      const lastAsk = [...allMessages].reverse().find(m =>
-        m.role === 'assistant' && /\*\*\d{4}-\d{2}-\d{2}\s+až\s+\d{4}-\d{2}-\d{2}\*\*/i.test(m.content)
-      )?.content || '';
-
-      if (!lastAsk) return null;
-
-      const isoPairs = [...lastAsk.matchAll(/\*\*(\d{4}-\d{2}-\d{2})\s+až\s+(\d{4}-\d{2}-\d{2})\*\*/g)]
-        .map(m => ({ from: m[1], to: m[2] }));
-
-      if (isoPairs.length === 0) return null;
-      // očekáváme: [ thisMonthPair, nextYearPair ] v pořadí, jak jsme je generovali
-      if (choice === 'this') return isoPairs[0] || null;
-      if (choice === 'next') return isoPairs[1] || null;
-      return null;
-    }
-
-    // ---- Pomocná funkce: vytvoř PARKING_RANGE z potvrzeného rozsahu ----
+    // Přednačtení dostupnosti pro rozsah (vrátí mapu dní)
     async function buildParkingRange(range) {
       if (!range) return null;
       const { from, to } = range;
@@ -162,19 +82,16 @@ export default async (req) => {
       const end = new Date(to + 'T00:00:00Z');
       while (cur <= end) {
         const dISO = toISODate(cur);
-        try {
-          out[dISO] = await gsGet({ fn: 'parking', date: dISO });
-        } catch (e) {
-          out[dISO] = { ok:false, error:String(e) };
-        }
+        try { out[dISO] = await gsGet({ fn: 'parking', date: dISO }); }
+        catch (e) { out[dISO] = { ok:false, error:String(e) }; }
         cur.setUTCDate(cur.getUTCDate() + 1);
       }
       return { from, to, days: out };
     }
 
-    // ---- Rozhodni rozsah ----
+    // ---- Parser & ask handling (sdílený) ----
     const lastUserText = [...messages].reverse().find(m => m.role === 'user')?.content || '';
-    let parsed = parseDatesSmart(lastUserText);
+    const parsed = parseDatesSmart(lastUserText);
     let confirmedRange = parsed.confirmed;
 
     // 1) Pokud parser vyžádal doptání → vrať dotaz a skonči
@@ -184,21 +101,22 @@ export default async (req) => {
       });
     }
 
-    // 2) Pokud parser nic nenašel (ani ask), zkusíme, zda uživatel neodpověděl na ask
+    // 2) Uživatel odpověděl „tento měsíc / příští rok“ (i bez diakritiky)
     if (!confirmedRange && !parsed.ask) {
-      const fromAsk = resolveRangeFromAsk(messages, lastUserText);
-      if (fromAsk) {
-        confirmedRange = fromAsk; // ← TEĎ už máme rozsah z odpovědi „tento měsíc / příští rok“
+      const askText = findLastAskText(messages);
+      if (askText) {
+        const choiceRange = resolveFromChoice(lastUserText, askText);
+        if (choiceRange) confirmedRange = choiceRange;
       }
     }
 
-    // ---- Pokud máme potvrzený rozsah → vytvoř PARKING_RANGE (ať už z parseru, nebo z odpovědi na ask)
+    // 3) Přednačtení dostupnosti (pokud už máme rozsah)
     let PARKING_RANGE = null;
     if (confirmedRange) {
       PARKING_RANGE = await buildParkingRange(confirmedRange);
     }
 
-    // ---- Parkovací instrukce (tvůj text) – přilepíme po úspěšném zápisu ----
+    // ---- Instrukce po potvrzení (text se použije po úspěšném zápisu) ----
     const PARKING_INSTRUCTIONS = `
 The parking is reserved for you, and it´s right behind the gate in our courtyard. Please note there is a very reasonable 20 euro charge per night. 
 
@@ -211,7 +129,7 @@ https://my.matterport.com/show/?m=PTEAUeUbMno
 If you have any questions, please do not hesitate to ask.
 `.trim();
 
-    // ---- Pravidla pro AI (TOOL protokol) ----
+    // ---- Pravidla pro AI (TOOL protokol zůstává) ----
     const rules = `
 You are a multilingual, precise assistant for ${HOTEL.name} (${HOTEL.address}, ${HOTEL.city}).
 Reply in the user's language. Never invent facts.
@@ -244,7 +162,6 @@ TOOL protocol (strict):
 ${confirmedRange ? `PARSED_RANGE: ${JSON.stringify(confirmedRange)}` : ''}
 `.trim();
 
-    // ---- Seed zprávy pro AI ----
     const seed = [
       { role: 'system', content: rules },
       { role: 'system', content: `HOTEL: ${JSON.stringify(HOTEL)}` },

@@ -14,8 +14,10 @@
     "react-dom": "^18.2.0"
   },
   "devDependencies": {
-    "vite": "^5.4.0",
+    "@types/node": "^24.4.0",
     "@vitejs/plugin-react": "^4.3.1",
-    "netlify-cli": "^17.21.0"
+    "netlify-cli": "^17.38.1",
+    "typescript": "^5.9.2",
+    "vite": "^5.4.0"
   }
 }
