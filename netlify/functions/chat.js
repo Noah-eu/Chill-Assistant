@@ -1,12 +1,8 @@
 // netlify/functions/chat.js
-// Chat funkce – sdílený parser, TOOL protokol, správná volba „tento měsíc / příští rok“
-// i pro jedno datum, robustní volání Apps Scriptu. Běží v Node runtime.
-
 export const config = { runtime: 'node' };
 
-import { parseDatesSmart, resolveFromChoice } from '../../src/lib/date';
+import { parseDatesSmart, resolveFromChoice } from './_lib/date.js';
 
-// Apps Script EXEC URL – fallback, pokud není SHEETS_API_URL v env
 const SHEETS_URL_FALLBACK =
   'https://script.google.com/macros/s/AKfycbzwiAqnD3JOMkMhNG4mew0zCsEp-ySA8WBgutQ38n6ZkF15SBVGU_no6gCPJqPnRAcohg/exec';
 
@@ -16,19 +12,16 @@ export default async (req) => {
       return new Response('Method Not Allowed', { status: 405 });
     }
 
-    // ---- BODY ----
     let body = {};
     try { body = await req.json(); } catch { return new Response('Bad JSON body', { status: 400 }); }
     const { messages = [] } = body;
 
-    // ---- ENV ----
     const OPENAI_API_KEY = (`${process.env.OPENAI_API_KEY ?? ''}`).trim();
     const SHEETS_API_URL = (`${process.env.SHEETS_API_URL ?? ''}`).trim() || SHEETS_URL_FALLBACK;
 
     if (!OPENAI_API_KEY) return new Response('Missing OPENAI_API_KEY', { status: 500 });
     try { new URL(SHEETS_API_URL); } catch { return new Response('Invalid SHEETS_API_URL', { status: 500 }); }
 
-    // ---- Načti hotel.json ----
     const base = new URL(req.url);
     const hotelUrl = new URL('/data/hotel.json', `${base.origin}`).toString();
     let HOTEL = {};
@@ -42,13 +35,12 @@ export default async (req) => {
       });
     }
 
-    // ---- Apps Script helpers (robustní JSON/HTML) ----
     async function gsGet(params) {
       const url = new URL(SHEETS_API_URL);
       Object.entries(params || {}).forEach(([k, v]) => url.searchParams.set(k, v));
       const r = await fetch(url.toString());
       const txt = await r.text();
-      if (!r.ok) throw new Error(`Sheets GET ${r.status} ${txt.slice(0, 200)}`);
+      if (!r.ok) throw new Error(`Sheets GET ${r.status} ${txt.slice(0,200)}`);
       try { return JSON.parse(txt); } catch { return { ok:false, raw: txt }; }
     }
     async function gsPost(payload) {
@@ -58,14 +50,11 @@ export default async (req) => {
         body: JSON.stringify(payload || {})
       });
       const txt = await r.text();
-      if (!r.ok) throw new Error(`Sheets POST ${r.status} ${txt.slice(0, 200)}`);
+      if (!r.ok) throw new Error(`Sheets POST ${r.status} ${txt.slice(0,200)}`);
       try { return JSON.parse(txt); } catch { return { ok:false, raw: txt }; }
     }
 
-    // ---- Util ----
     const toISODate = (d) => d.toISOString().slice(0, 10);
-
-    // Najdi POSLEDNÍ doptávací zprávu asistenta s ISO (páry i single)
     function findLastAskText(msgs) {
       const m = [...msgs].reverse().find(
         m => m.role === 'assistant' &&
@@ -73,8 +62,6 @@ export default async (req) => {
       );
       return m?.content || null;
     }
-
-    // Přednačtení dostupnosti pro rozsah (vrátí mapu dní)
     async function buildParkingRange(range) {
       if (!range) return null;
       const { from, to } = range;
@@ -90,19 +77,16 @@ export default async (req) => {
       return { from, to, days: out };
     }
 
-    // ---- Parser & ask handling (sdílený) ----
     const lastUserText = [...messages].reverse().find(m => m.role === 'user')?.content || '';
     const parsed = parseDatesSmart(lastUserText);
     let confirmedRange = parsed.confirmed;
 
-    // 1) Pokud parser vyžádal doptání → vrať dotaz a skonči
     if (!confirmedRange && parsed.ask) {
       return new Response(JSON.stringify({ reply: parsed.ask }), {
         status: 200, headers: { 'content-type': 'application/json' }
       });
     }
 
-    // 2) Uživatel odpověděl „tento měsíc / příští rok“ (funguje i bez diakritiky, pro range i single)
     if (!confirmedRange && !parsed.ask) {
       const askText = findLastAskText(messages);
       if (askText) {
@@ -111,13 +95,11 @@ export default async (req) => {
       }
     }
 
-    // 3) Přednačtení dostupnosti (pokud už máme rozsah)
     let PARKING_RANGE = null;
     if (confirmedRange) {
       PARKING_RANGE = await buildParkingRange(confirmedRange);
     }
 
-    // ---- Instrukce po potvrzení (text se použije po úspěšném zápisu) ----
     const PARKING_INSTRUCTIONS = `
 The parking is reserved for you, and it´s right behind the gate in our courtyard. Please note there is a very reasonable 20 euro charge per night. 
 
@@ -130,7 +112,6 @@ https://my.matterport.com/show/?m=PTEAUeUbMno
 If you have any questions, please do not hesitate to ask.
 `.trim();
 
-    // ---- Pravidla pro AI (TOOL protokol) ----
     const rules = `
 You are a multilingual, precise assistant for ${HOTEL.name} (${HOTEL.address}, ${HOTEL.city}).
 Reply in the user's language. Never invent facts.
@@ -169,7 +150,6 @@ ${confirmedRange ? `PARSED_RANGE: ${JSON.stringify(confirmedRange)}` : ''}
       { role: 'system', content: `PARKING_RANGE: ${JSON.stringify(PARKING_RANGE)}` }
     ];
 
-    // ---- OpenAI helper ----
     async function callOpenAI(msgs) {
       const r = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
@@ -184,10 +164,8 @@ ${confirmedRange ? `PARSED_RANGE: ${JSON.stringify(confirmedRange)}` : ''}
       return data.choices?.[0]?.message?.content || '';
     }
 
-    // ---- 1. průchod AI ----
     let ai = await callOpenAI([...seed, ...messages]);
 
-    // ---- TOOL brancha (read/write) ----
     const toolMatch = /^TOOL:\s*(.+)$/im.exec(ai || '');
     if (toolMatch) {
       const cmd = (toolMatch[1] || '').trim();
@@ -203,7 +181,7 @@ ${confirmedRange ? `PARSED_RANGE: ${JSON.stringify(confirmedRange)}` : ''}
         try { payload = JSON.parse(json); } catch { result = { ok:false, error:'Bad JSON for reserveParking' }; }
         if (!result) {
           payload.fn = 'reserveParking';
-          console.log('reserveParking payload:', payload); // DEBUG
+          console.log('reserveParking payload:', payload);
           result = await gsPost(payload);
           wrote = true;
         }
