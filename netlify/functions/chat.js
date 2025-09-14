@@ -1,7 +1,6 @@
 // netlify/functions/chat.js
-// Chat funkce – jednotný parser dat, TOOL protokol pro čtení/zápis do Sheets,
-// deterministické doptání „tento měsíc / příští rok“ (funguje i bez diakritiky),
-// fallback na Apps Script URL, OPENAI_API_KEY z ENV. Běží v Node runtime.
+// Chat funkce – sdílený parser, TOOL protokol, správná volba „tento měsíc / příští rok“
+// i pro jedno datum, robustní volání Apps Scriptu. Běží v Node runtime.
 
 export const config = { runtime: 'node' };
 
@@ -43,13 +42,14 @@ export default async (req) => {
       });
     }
 
-    // ---- Apps Script helpers ----
+    // ---- Apps Script helpers (robustní JSON/HTML) ----
     async function gsGet(params) {
       const url = new URL(SHEETS_API_URL);
       Object.entries(params || {}).forEach(([k, v]) => url.searchParams.set(k, v));
       const r = await fetch(url.toString());
-      if (!r.ok) throw new Error(`Sheets GET ${r.status} ${await r.text().catch(()=> '')}`);
-      return await r.json();
+      const txt = await r.text();
+      if (!r.ok) throw new Error(`Sheets GET ${r.status} ${txt.slice(0, 200)}`);
+      try { return JSON.parse(txt); } catch { return { ok:false, raw: txt }; }
     }
     async function gsPost(payload) {
       const r = await fetch(SHEETS_API_URL, {
@@ -57,18 +57,19 @@ export default async (req) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload || {})
       });
-      if (!r.ok) throw new Error(`Sheets POST ${r.status} ${await r.text().catch(()=> '')}`);
-      return await r.json();
+      const txt = await r.text();
+      if (!r.ok) throw new Error(`Sheets POST ${r.status} ${txt.slice(0, 200)}`);
+      try { return JSON.parse(txt); } catch { return { ok:false, raw: txt }; }
     }
 
     // ---- Util ----
     const toISODate = (d) => d.toISOString().slice(0, 10);
 
-    // Najdi POSLEDNÍ doptávací zprávu asistenta s ISO páry (pro resolveFromChoice)
+    // Najdi POSLEDNÍ doptávací zprávu asistenta s ISO (páry i single)
     function findLastAskText(msgs) {
       const m = [...msgs].reverse().find(
         m => m.role === 'assistant' &&
-             /\*\*\d{4}-\d{2}-\d{2}\s+až\s+\d{4}-\d{2}-\d{2}\*\*/i.test(m.content)
+             /\*\*\d{4}-\d{2}-\d{2}(?:\s+až\s+\d{4}-\d{2}-\d{2})?\*\*/i.test(m.content)
       );
       return m?.content || null;
     }
@@ -101,7 +102,7 @@ export default async (req) => {
       });
     }
 
-    // 2) Uživatel odpověděl „tento měsíc / příští rok“ (funguje i bez diakritiky)
+    // 2) Uživatel odpověděl „tento měsíc / příští rok“ (funguje i bez diakritiky, pro range i single)
     if (!confirmedRange && !parsed.ask) {
       const askText = findLastAskText(messages);
       if (askText) {
@@ -202,8 +203,7 @@ ${confirmedRange ? `PARSED_RANGE: ${JSON.stringify(confirmedRange)}` : ''}
         try { payload = JSON.parse(json); } catch { result = { ok:false, error:'Bad JSON for reserveParking' }; }
         if (!result) {
           payload.fn = 'reserveParking';
-          // DEBUG log (uvidíš v Netlify logu přes "Functions > logs")
-          console.log('reserveParking payload:', payload);
+          console.log('reserveParking payload:', payload); // DEBUG
           result = await gsPost(payload);
           wrote = true;
         }
