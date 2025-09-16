@@ -1,13 +1,14 @@
 // netlify/functions/chat.js
-// Kompletní funkční verze s:
-// - Smart parsováním dat (včetně doptání, když je uveden minulý měsíc bez roku)
-// - Čtením denních kapacit z Google Sheets (GET fn=parking&date=YYYY-MM-DD)
-// - Zápisem rezervací do listu Reservations (POST fn=reserveParking {...})
-// - "TOOL" protokolem (AI si vyžádá parking nebo zápis)
-// - Po úspěšné rezervaci POŠLE hned INSTRUKCE k parkování + odkazy na fotky
-// - Volitelným překladem instrukcí do jazyka uživatele (přepínač níže)
+// - Smart parsing dat + doptání u minulého měsíce bez roku
+// - Čtení kapacit z Sheets (GET ?fn=parking&date=YYYY-MM-DD)
+// - Zápis rezervace (POST {fn:reserveParking,...})
+// - TOOL protokol
+// - Po úspěšné rezervaci: okamžitě instrukce + fotky (jako obrázky)
+// - Silnější pravidla pro multi-day dostupnost (vypisuj KAŽDÝ den)
+// - Připravené PARKING_LIST pro AI (array {date,total,booked,free})
+// - Volitelný překlad instrukcí do jazyka uživatele
 
-const TRANSLATE_INSTRUCTIONS = true; // ← pokud chceš překládat do jazyka hosta, přepni na true
+const TRANSLATE_INSTRUCTIONS = true;
 
 export default async (req) => {
   try {
@@ -61,7 +62,7 @@ export default async (req) => {
     const daysInMonth = (y,m) => new Date(y, m, 0).getDate();
     const clampDay = (y,m,d) => Math.min(d, daysInMonth(y,m));
 
-    // ---- Smart date parsing + doptání, když je měsíc v minulosti bez roku ----
+    // Smart parse
     function parseDatesSmart(text) {
       const now = new Date();
       const CY = now.getFullYear();
@@ -69,7 +70,7 @@ export default async (req) => {
 
       const re = /(\d{1,2})\s*[.\-\/]\s*(\d{1,2})(?:\s*[.\-\/]\s*(\d{2,4}))?/g;
 
-      let hits = [];
+      const hits = [];
       let m;
       while ((m = re.exec(text)) !== null) {
         let [ , d, mo, y ] = m;
@@ -108,19 +109,18 @@ export default async (req) => {
       return { confirmed: { from, to }, ask: null };
     }
 
-    // ---- z poslední user msg vyčíst rozsah ----
     const lastUserText = [...messages].reverse().find(m => m.role === 'user')?.content || '';
     const parsed = parseDatesSmart(lastUserText);
 
-    // ---- Pokud je potřeba upřesnit → vrať rovnou "ask" ----
     if (parsed.ask) {
       return new Response(JSON.stringify({ reply: parsed.ask }), {
         status: 200, headers: { 'content-type': 'application/json' }
       });
     }
 
-    // ---- Přednačtení denních dat z Sheets (pokud máme data range) ----
+    // ---- Přednačtení denních dat z Sheets (pokud máme range) ----
     let PARKING_RANGE = null;
+    let PARKING_LIST = [];
     if (parsed.confirmed) {
       const { from, to } = parsed.confirmed;
       const out = {};
@@ -129,9 +129,21 @@ export default async (req) => {
       while (cur <= end) {
         const dISO = toISODate(cur);
         try {
-          out[dISO] = await gsGet({ fn: 'parking', date: dISO });
+          const day = await gsGet({ fn: 'parking', date: dISO });
+          out[dISO] = day;
+          if (day && day.ok) {
+            PARKING_LIST.push({
+              date: dISO,
+              total: Number(day.total_spots || 0),
+              booked: Number(day.booked || 0),
+              free: Math.max(0, Number(day.total_spots || 0) - Number(day.booked || 0))
+            });
+          } else {
+            PARKING_LIST.push({ date: dISO, total: null, booked: null, free: null, error: day?.error || 'unknown' });
+          }
         } catch (e) {
           out[dISO] = { ok:false, error:String(e) };
+          PARKING_LIST.push({ date: dISO, total: null, booked: null, free: null, error: String(e) });
         }
         cur.setUTCDate(cur.getUTCDate() + 1);
       }
@@ -169,27 +181,31 @@ Parkoviště je na našem dvoře v ceně 20 eur (500 Kč) za noc. Odkud přijí�
 Na dvoře/parkovišti, je hlavní vchod.
 `.trim();
 
+    // ---- Fotky jako MARKDOWN OBRÁZKY ----
     function mediaBlock() {
       if (!Array.isArray(MEDIA) || MEDIA.length === 0) return '';
-      const lines = MEDIA.map((m, i) => `- ${m.caption || `Foto ${i+1}`}: ${new URL(`/${m.src}`, `${base.origin}`).toString()}`);
-      return `\n\n**Fotky / mapa / animace:**\n${lines.join('\n')}`;
+      const lines = MEDIA.map((m) => {
+        const url = new URL(`/${m.src}`, `${base.origin}`).toString();
+        const caption = m.caption || '';
+        return `![${caption}](${url})`;
+      });
+      return `\n\n${lines.join('\n')}`;
     }
 
-    // ---- RULES pro AI ----
+    // ---- RULES pro AI (upevněné multi-day chování) ----
     const rules = `
 You are a multilingual, precise assistant for ${HOTEL.name || 'our hotel'}.
 Reply in the user's language. Never invent facts.
 
 DATES:
 - If I already asked the user to clarify dates (ASK), wait for clear dates before availability.
-- When PARSED_RANGE exists, restate the ISO dates first.
+- When PARSED_RANGE exists, you MUST list availability **for every day in the range** using PARKING_LIST.
+  Do not call any tool for those days; the data is already provided.
 
 PARKING (Google Sheets):
 - Daily availability = free = total_spots - booked.
-- Use PARKING_RANGE.days[YYYY-MM-DD] when provided (already fetched).
-- For a multi-day request, list availability per-day. If any day has missing data or unknown, say "availability to be confirmed" for that day.
-- If free > 0 → say “There appears to be X spot(s) available.”
-- If free = 0 → say “fully booked” and offer alternatives if present.
+- Use PARKING_LIST when provided (already fetched).
+- If any day has free = 0, say that day is fully booked.
 - If user wants to proceed, ask ONLY:
   • Guest name (required)
   • Car plate / SPZ (required)
@@ -197,31 +213,33 @@ PARKING (Google Sheets):
 - When the user gives those, WRITE via:
   TOOL: reserveParking {"from_date":"<FROM>","to_date":"<TO>","guest_name":"John Doe","channel":"Direct","car_plate":"ABC1234","arrival_time":"18:30","note":""}
 - After successful write, reply: "✅ Reservation recorded. ID: <id>. Price is 20 € / night."
-- Do NOT send instructions yourself — the function will append parking instructions automatically after reservation.
+- Do NOT send instructions yourself — the function will append parking instructions + photos automatically after reservation.
 
 TOOL protocol (strict):
-- To read parking: "TOOL: parking YYYY-MM-DD"
+- To read parking: "TOOL: parking YYYY-MM-DD" (only when range not pre-fetched).
 - To write reservation: "TOOL: reserveParking {...JSON...}"
 After TOOL-RESULT, continue the answer using only that data.
 `.trim();
 
-    // ---- SEED pro AI ----
+    // ---- SEED ----
     const seed = [
       { role: 'system', content: rules },
       { role: 'system', content: `HOTEL: ${JSON.stringify(HOTEL)}` },
-      { role: 'system', content: `PARKING_RANGE: ${JSON.stringify(PARKING_RANGE)}` }
+      { role: 'system', content: `PARSED_RANGE: ${JSON.stringify(parsed.confirmed || null)}` },
+      { role: 'system', content: `PARKING_LIST: ${JSON.stringify(PARKING_LIST)}` }
     ];
 
     // ---- 1. průchod AI ----
     let ai = await callOpenAI([...seed, ...messages]);
 
-    // ---- Pokud AI požádá o TOOL ----
+    // ---- TOOL požadavek? ----
     const mTool = /^TOOL:\s*(.+)$/im.exec(ai || '');
     if (mTool) {
       const cmd = (mTool[1] || '').trim();
       let result;
 
       if (/^parking\s+\d{4}-\d{2}-\d{2}$/i.test(cmd)) {
+        // fallback – když AI přesto chce jeden den
         const d = cmd.split(/\s+/)[1];
         result = await gsGet({ fn: 'parking', date: d });
 
@@ -241,7 +259,7 @@ After TOOL-RESULT, continue the answer using only that data.
       const toolMsg = { role: 'system', content: `TOOL-RESULT: ${JSON.stringify(result)}` };
       ai = await callOpenAI([...seed, ...messages, toolMsg]);
 
-      // === NOVÉ: když se rezervace povedla, přidej instrukce + fotky ===
+      // Po úspěšné rezervaci → instrukce + fotky (markdown obrázky)
       const okReservation = result && result.ok && result.id;
       if (okReservation) {
         const instr = await translateIfNeeded(parkingInstructionsCZ, messages);
@@ -252,7 +270,7 @@ After TOOL-RESULT, continue the answer using only that data.
       }
     }
 
-    // Bez TOOLu, nebo rezervace se nepovedla → běžná odpověď
+    // Bez TOOLu → běžná odpověď
     return new Response(JSON.stringify({ reply: ai || 'No reply.' }), {
       status: 200, headers: { 'content-type': 'application/json' }
     });
