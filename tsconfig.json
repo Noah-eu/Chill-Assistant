@@ -10,5 +10,6 @@
     "allowJs": true,
     "resolveJsonModule": true
   },
-  "include": ["netlify/functions/**/*", "src/**/*"]
+  "include": ["src/**/*"],
+  "exclude": ["netlify/functions"]
 }

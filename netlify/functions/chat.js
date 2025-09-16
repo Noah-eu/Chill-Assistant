@@ -1,27 +1,20 @@
 // netlify/functions/chat.js
-export const config = { runtime: 'node' };
-
 import { parseDatesSmart, resolveFromChoice } from './_lib/date.js';
-
-const SHEETS_URL_FALLBACK =
-  'https://script.google.com/macros/s/AKfycbzwiAqnD3JOMkMhNG4mew0zCsEp-ySA8WBgutQ38n6ZkF15SBVGU_no6gCPJqPnRAcohg/exec';
 
 export default async (req) => {
   try {
-    if (req.method !== 'POST') {
-      return new Response('Method Not Allowed', { status: 405 });
-    }
+    if (req.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
 
     let body = {};
     try { body = await req.json(); } catch { return new Response('Bad JSON body', { status: 400 }); }
     const { messages = [] } = body;
 
-    const OPENAI_API_KEY = (`${process.env.OPENAI_API_KEY ?? ''}`).trim();
-    const SHEETS_API_URL = (`${process.env.SHEETS_API_URL ?? ''}`).trim() || SHEETS_URL_FALLBACK;
-
+    const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+    const SHEETS_API_URL = process.env.SHEETS_API_URL;
     if (!OPENAI_API_KEY) return new Response('Missing OPENAI_API_KEY', { status: 500 });
-    try { new URL(SHEETS_API_URL); } catch { return new Response('Invalid SHEETS_API_URL', { status: 500 }); }
+    if (!SHEETS_API_URL) return new Response('Missing SHEETS_API_URL', { status: 500 });
 
+    // hotel.json
     const base = new URL(req.url);
     const hotelUrl = new URL('/data/hotel.json', `${base.origin}`).toString();
     let HOTEL = {};
@@ -30,18 +23,16 @@ export default async (req) => {
       if (!r.ok) throw new Error(`hotel.json ${r.status}`);
       HOTEL = await r.json();
     } catch (e) {
-      return new Response(`Cannot load hotel.json: ${String(e)}`, {
-        status: 500, headers: { 'content-type': 'text/plain' }
-      });
+      return new Response(`Cannot load hotel.json: ${String(e)}`, { status: 500, headers: { 'content-type': 'text/plain' } });
     }
 
+    // Apps Script helpers
     async function gsGet(params) {
       const url = new URL(SHEETS_API_URL);
       Object.entries(params || {}).forEach(([k, v]) => url.searchParams.set(k, v));
       const r = await fetch(url.toString());
-      const txt = await r.text();
-      if (!r.ok) throw new Error(`Sheets GET ${r.status} ${txt.slice(0,200)}`);
-      try { return JSON.parse(txt); } catch { return { ok:false, raw: txt }; }
+      if (!r.ok) throw new Error(`Sheets GET ${r.status}`);
+      return await r.json();
     }
     async function gsPost(payload) {
       const r = await fetch(SHEETS_API_URL, {
@@ -49,71 +40,52 @@ export default async (req) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload || {})
       });
-      const txt = await r.text();
-      if (!r.ok) throw new Error(`Sheets POST ${r.status} ${txt.slice(0,200)}`);
-      try { return JSON.parse(txt); } catch { return { ok:false, raw: txt }; }
+      if (!r.ok) throw new Error(`Sheets POST ${r.status}`);
+      return await r.json();
     }
 
-    const toISODate = (d) => d.toISOString().slice(0, 10);
-    function findLastAskText(msgs) {
-      const m = [...msgs].reverse().find(
-        m => m.role === 'assistant' &&
-             /\*\*\d{4}-\d{2}-\d{2}(?:\s+až\s+\d{4}-\d{2}-\d{2})?\*\*/i.test(m.content)
-      );
-      return m?.content || null;
-    }
-    async function buildParkingRange(range) {
-      if (!range) return null;
-      const { from, to } = range;
-      const out = {};
-      let cur = new Date(from + 'T00:00:00Z');
-      const end = new Date(to + 'T00:00:00Z');
-      while (cur <= end) {
-        const dISO = toISODate(cur);
-        try { out[dISO] = await gsGet({ fn: 'parking', date: dISO }); }
-        catch (e) { out[dISO] = { ok:false, error:String(e) }; }
-        cur.setUTCDate(cur.getUTCDate() + 1);
-      }
-      return { from, to, days: out };
-    }
-
+    // Smart parsing dat z poslední user zprávy
     const lastUserText = [...messages].reverse().find(m => m.role === 'user')?.content || '';
     const parsed = parseDatesSmart(lastUserText);
-    let confirmedRange = parsed.confirmed;
 
-    if (!confirmedRange && parsed.ask) {
+    if (parsed.ask) {
       return new Response(JSON.stringify({ reply: parsed.ask }), {
         status: 200, headers: { 'content-type': 'application/json' }
       });
     }
 
-    if (!confirmedRange && !parsed.ask) {
-      const askText = findLastAskText(messages);
-      if (askText) {
-        const choiceRange = resolveFromChoice(lastUserText, askText);
-        if (choiceRange) confirmedRange = choiceRange;
+    // Když uživatel odpoví „tento měsíc / příští rok“
+    if (!parsed.confirmed) {
+      const reply = (txt) => new Response(JSON.stringify({ reply: txt }), { status: 200, headers: { 'content-type': 'application/json' } });
+      const choiceMsg = [...messages].reverse().find(m => m.role === 'user' && /tento|příšt|pristi/i.test(m.content || ''));
+      if (choiceMsg && parsed.options) {
+        const resolved = resolveFromChoice(choiceMsg.content, parsed);
+        if (resolved) {
+          parsed.confirmed = resolved;
+        } else {
+          return reply('Prosím, napište „tento měsíc“ nebo „příští rok“, případně přesná ISO data (YYYY-MM-DD až YYYY-MM-DD).');
+        }
       }
     }
 
+    // Pokud máme rozsah, načti dostupnost (per-day)
     let PARKING_RANGE = null;
-    if (confirmedRange) {
-      PARKING_RANGE = await buildParkingRange(confirmedRange);
+    if (parsed.confirmed) {
+      const { from, to } = parsed.confirmed;
+      const out = {};
+      let cur = new Date(from + 'T00:00:00Z');
+      const end = new Date(to + 'T00:00:00Z');
+      while (cur <= end) {
+        const dISO = cur.toISOString().slice(0, 10);
+        try { out[dISO] = await gsGet({ fn: 'parking', date: dISO }); }
+        catch (e) { out[dISO] = { ok: false, error: String(e) }; }
+        cur.setUTCDate(cur.getUTCDate() + 1);
+      }
+      PARKING_RANGE = { from, to, days: out };
     }
 
-    const PARKING_INSTRUCTIONS = `
-The parking is reserved for you, and it´s right behind the gate in our courtyard. Please note there is a very reasonable 20 euro charge per night. 
-
-Also, please have a look at Google Street View for an idea of how to get into our hotel, as there is a narrow passage to pass through: height of 220cm and width of 220cm.
-You can see in the attachment 7 photos of how to find us and how to park. I am not sure from which side you will arrive, but in case you’ll come from the north and you’ll come straight to our street, then drive around us and then around the block and come to our street again from behind the corner.  Then there will be no other cars behind you, and you can use the middle, or even better, the opposite line. Then you can drive perpendicularly to the building and through the narrow passage to our courtyard/parking lot. 
-Here you can see a 3D visualization of our hotel. The reception, second entrance (also for cars), laundry in a basement, and the apartments on the 1st floor. On the other floors, the setting is the same.
-
-https://my.matterport.com/show/?m=PTEAUeUbMno
-
-If you have any questions, please do not hesitate to ask.
-`.trim();
-
     const rules = `
-You are a multilingual, precise assistant for ${HOTEL.name} (${HOTEL.address}, ${HOTEL.city}).
+You are a multilingual, precise assistant for ${HOTEL.name}.
 Reply in the user's language. Never invent facts.
 
 DATES:
@@ -123,25 +95,12 @@ DATES:
 PARKING (Google Sheets):
 - Daily availability = free = total_spots - booked.
 - Use PARKING_RANGE.days[YYYY-MM-DD] when provided (already fetched).
-- For a multi-day request, list availability per-day. If any day has missing data or unknown, say "availability to be confirmed" for that day.
-- If free > 0 → say “There appears to be X spot(s) available.”
-- If free = 0 → say “fully booked” and offer ${HOTEL.parking?.altUrl || ''}. Mention: ${HOTEL.parking?.weekendFreeTips || ''}.
-- If user wants to proceed, ask ONLY:
-  • Guest name (required)
-  • Car plate / SPZ (required)
-  • Arrival time HH:mm (recommended)
-- When the user gives those, WRITE via:
+- For a multi-day request, list availability per-day.
+- If any day has free > 0 → allow reservation (ask for guest name, car plate, arrival time).
+- When user provides them, write:
   TOOL: reserveParking {"from_date":"<FROM>","to_date":"<TO>","guest_name":"John Doe","channel":"Direct","car_plate":"ABC1234","arrival_time":"18:30","note":""}
-- After successful write, say only: "OK" (I will construct the final confirmation with instructions).
-- Never invent an ID. If write failed, say: "write_failed".
-
-SELF CHECK-IN/WIFI/TAXI/NEARBY – keep concise using HOTEL data.
-
-TOOL protocol (strict):
-- To read parking: "TOOL: parking YYYY-MM-DD"
-- To write reservation: "TOOL: reserveParking {...JSON...}"
-- After TOOL-RESULT, continue using only that data.
-${confirmedRange ? `PARSED_RANGE: ${JSON.stringify(confirmedRange)}` : ''}
+- After success reply: "✅ Rezervace zapsána. ID: <id>. Cena je ${HOTEL.parking?.priceEurPerNight || 20} € / noc."
+- If fully booked any day → say fully booked and offer ${HOTEL.parking?.altUrl || ''}.
 `.trim();
 
     const seed = [
@@ -166,10 +125,11 @@ ${confirmedRange ? `PARSED_RANGE: ${JSON.stringify(confirmedRange)}` : ''}
 
     let ai = await callOpenAI([...seed, ...messages]);
 
-    const toolMatch = /^TOOL:\s*(.+)$/im.exec(ai || '');
-    if (toolMatch) {
-      const cmd = (toolMatch[1] || '').trim();
-      let result, wrote = false;
+    // TOOL protokol
+    const mTool = /^TOOL:\s*(.+)$/im.exec(ai || '');
+    if (mTool) {
+      const cmd = (mTool[1] || '').trim();
+      let result;
 
       if (/^parking\s+\d{4}-\d{2}-\d{2}$/i.test(cmd)) {
         const d = cmd.split(/\s+/)[1];
@@ -178,28 +138,15 @@ ${confirmedRange ? `PARSED_RANGE: ${JSON.stringify(confirmedRange)}` : ''}
       } else if (/^reserveParking\s+/i.test(cmd)) {
         const json = cmd.replace(/^reserveParking\s+/i, '').trim();
         let payload;
-        try { payload = JSON.parse(json); } catch { result = { ok:false, error:'Bad JSON for reserveParking' }; }
+        try { payload = JSON.parse(json); }
+        catch { result = { ok: false, error: 'Bad JSON for reserveParking' }; }
         if (!result) {
           payload.fn = 'reserveParking';
-          console.log('reserveParking payload:', payload);
           result = await gsPost(payload);
-          wrote = true;
         }
 
       } else {
-        result = { ok:false, error:'unknown tool cmd' };
-      }
-
-      if (wrote && result && result.ok && result.id) {
-        const price = HOTEL.parking?.priceEurPerNight || 20;
-        const final = [
-          `✅ Rezervace parkování byla potvrzena a zapsána. **ID: ${result.id}**. Cena je ${price} € / noc.`,
-          '',
-          PARKING_INSTRUCTIONS
-        ].join('\n');
-        return new Response(JSON.stringify({ reply: final }), {
-          status: 200, headers: { 'content-type': 'application/json' }
-        });
+        result = { ok: false, error: 'unknown tool cmd' };
       }
 
       const toolMsg = { role: 'system', content: `TOOL-RESULT: ${JSON.stringify(result)}` };
@@ -211,8 +158,6 @@ ${confirmedRange ? `PARSED_RANGE: ${JSON.stringify(confirmedRange)}` : ''}
     });
 
   } catch (err) {
-    return new Response(`Function error: ${String(err)}`, {
-      status: 500, headers: { 'content-type': 'text/plain' }
-    });
+    return new Response(`Function error: ${String(err)}`, { status: 500, headers: { 'content-type': 'text/plain' } });
   }
 };
