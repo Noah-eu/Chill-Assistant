@@ -1,5 +1,13 @@
 // netlify/functions/chat.js
-// Kompletní verze s automatickým posláním instrukcí po úspěšné rezervaci.
+// Kompletní funkční verze s:
+// - Smart parsováním dat (včetně doptání, když je uveden minulý měsíc bez roku)
+// - Čtením denních kapacit z Google Sheets (GET fn=parking&date=YYYY-MM-DD)
+// - Zápisem rezervací do listu Reservations (POST fn=reserveParking {...})
+// - "TOOL" protokolem (AI si vyžádá parking nebo zápis)
+// - Po úspěšné rezervaci POŠLE hned INSTRUKCE k parkování + odkazy na fotky
+// - Volitelným překladem instrukcí do jazyka uživatele (přepínač níže)
+
+const TRANSLATE_INSTRUCTIONS = true; // ← pokud chceš překládat do jazyka hosta, přepni na true
 
 export default async (req) => {
   try {
@@ -18,18 +26,16 @@ export default async (req) => {
     if (!OPENAI_API_KEY) return new Response('Missing OPENAI_API_KEY', { status: 500 });
     if (!SHEETS_API_URL) return new Response('Missing SHEETS_API_URL', { status: 500 });
 
-    // ---- HOTEL STATIC (optional) ----
-    // Pokud máš public/data/hotel.json, načteme ho (kvůli ceně apod.). Když ne, nastavíme fallback.
+    // ---- PUBLIC data ----
     const base = new URL(req.url);
-    const hotelUrl = new URL('/data/hotel.json', `${base.origin}`).toString();
-    let HOTEL = {
-      name: 'CHILL Apartments',
-      parking: { priceEurPerNight: 20 }
-    };
-    try {
-      const r = await fetch(hotelUrl, { headers: { 'cache-control': 'no-cache' } });
-      if (r.ok) HOTEL = await r.json();
-    } catch {}
+    async function loadJSON(path) {
+      const url = new URL(path, `${base.origin}`).toString();
+      const r = await fetch(url, { headers: { 'cache-control': 'no-cache' } });
+      if (!r.ok) throw new Error(`${path} ${r.status}`);
+      return await r.json();
+    }
+    const HOTEL = await loadJSON('/data/hotel.json').catch(() => ({}));
+    const MEDIA = await loadJSON('/data/parking_media.json').catch(() => []);
 
     // ---- Apps Script helpers ----
     async function gsGet(params) {
@@ -55,7 +61,7 @@ export default async (req) => {
     const daysInMonth = (y,m) => new Date(y, m, 0).getDate();
     const clampDay = (y,m,d) => Math.min(d, daysInMonth(y,m));
 
-    // ---- Smart date parsing + „tento měsíc / příští rok“ doptání ----
+    // ---- Smart date parsing + doptání, když je měsíc v minulosti bez roku ----
     function parseDatesSmart(text) {
       const now = new Date();
       const CY = now.getFullYear();
@@ -77,7 +83,6 @@ export default async (req) => {
 
       if (!A.y) A.y = CY;
       if (!B.y) B.y = A.y;
-
       if (!A.mo && B.mo) A.mo = B.mo;
       if (!B.mo && A.mo) B.mo = A.mo;
       if (!A.mo) A.mo = CM;
@@ -85,6 +90,7 @@ export default async (req) => {
 
       const Aa = { y: A.y, mo: A.mo, d: clampDay(A.y, A.mo, A.d) };
       const Bb = { y: B.y, mo: B.mo, d: clampDay(B.y, B.mo, B.d) };
+
       const isoA = fmtISO(Aa.y, Aa.mo, Aa.d);
       const isoB = fmtISO(Bb.y, Bb.mo, Bb.d);
 
@@ -102,17 +108,18 @@ export default async (req) => {
       return { confirmed: { from, to }, ask: null };
     }
 
-    // ---- zkus z poslední user msg vyčíst rozsah ----
+    // ---- z poslední user msg vyčíst rozsah ----
     const lastUserText = [...messages].reverse().find(m => m.role === 'user')?.content || '';
     const parsed = parseDatesSmart(lastUserText);
 
+    // ---- Pokud je potřeba upřesnit → vrať rovnou "ask" ----
     if (parsed.ask) {
       return new Response(JSON.stringify({ reply: parsed.ask }), {
         status: 200, headers: { 'content-type': 'application/json' }
       });
     }
 
-    // ---- Pokud máme potvrzený rozsah → načti denní data (inclusive) ----
+    // ---- Přednačtení denních dat z Sheets (pokud máme data range) ----
     let PARKING_RANGE = null;
     if (parsed.confirmed) {
       const { from, to } = parsed.confirmed;
@@ -131,7 +138,7 @@ export default async (req) => {
       PARKING_RANGE = { from, to, days: out };
     }
 
-    // ---- OpenAI helper ----
+    // ---- OpenAI helpers ----
     async function callOpenAI(msgs) {
       const r = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
@@ -146,9 +153,31 @@ export default async (req) => {
       return data.choices?.[0]?.message?.content || '';
     }
 
-    // ---- RULES pro AI (čtení dostupnosti + návod na TOOL) ----
+    async function translateIfNeeded(text, userMsgs) {
+      if (!TRANSLATE_INSTRUCTIONS) return text;
+      const userLangSample = ([...userMsgs].reverse().find(m => m.role === 'user')?.content || '').slice(0, 500);
+      const msgs = [
+        { role: 'system', content: 'You are a precise translator. Keep meaning and formatting. If source language equals target, return as is.' },
+        { role: 'user', content: `User language sample:\n---\n${userLangSample}\n---\nTranslate the following text to the user's language:\n${text}` }
+      ];
+      return await callOpenAI(msgs);
+    }
+
+    // ---- Instrukce k parkování (CZ) – přesně podle tebe ----
+    const parkingInstructionsCZ = `
+Parkoviště je na našem dvoře v ceně 20 eur (500 Kč) za noc. Odkud přijíždíte? Pokud od jihu, tak až zabočíte na naší ulici, zařaďte se do pravého pruhu a tam pak vyčkejte až bude silnice prázdná. Z něj pak kolmo rovnou do našeho průjezdu na dvůr. Ten průjezd je totiž dost úzký (šířka 220 cm) a z krajního pruhu se do něj nedá vjet. Pokud přijíždíte z druhé strany, objeďte radši ještě náš blok. Bude totiž za vámi velký provoz a nebude možnost zajet do průjezdu z protějšího pruhu. Pokud blok objedete, nepojede za vámi skoro nikdo.
+Na dvoře/parkovišti, je hlavní vchod.
+`.trim();
+
+    function mediaBlock() {
+      if (!Array.isArray(MEDIA) || MEDIA.length === 0) return '';
+      const lines = MEDIA.map((m, i) => `- ${m.caption || `Foto ${i+1}`}: ${new URL(`/${m.src}`, `${base.origin}`).toString()}`);
+      return `\n\n**Fotky / mapa / animace:**\n${lines.join('\n')}`;
+    }
+
+    // ---- RULES pro AI ----
     const rules = `
-You are a multilingual, precise assistant for ${HOTEL.name}.
+You are a multilingual, precise assistant for ${HOTEL.name || 'our hotel'}.
 Reply in the user's language. Never invent facts.
 
 DATES:
@@ -160,14 +189,15 @@ PARKING (Google Sheets):
 - Use PARKING_RANGE.days[YYYY-MM-DD] when provided (already fetched).
 - For a multi-day request, list availability per-day. If any day has missing data or unknown, say "availability to be confirmed" for that day.
 - If free > 0 → say “There appears to be X spot(s) available.”
-- If free = 0 → say “fully booked” and offer mrparkit.com.
+- If free = 0 → say “fully booked” and offer alternatives if present.
 - If user wants to proceed, ask ONLY:
   • Guest name (required)
   • Car plate / SPZ (required)
   • Arrival time HH:mm (recommended)
 - When the user gives those, WRITE via:
   TOOL: reserveParking {"from_date":"<FROM>","to_date":"<TO>","guest_name":"John Doe","channel":"Direct","car_plate":"ABC1234","arrival_time":"18:30","note":""}
-- After successful write, reply with confirmation and include the parking instructions in Czech.
+- After successful write, reply: "✅ Reservation recorded. ID: <id>. Price is 20 € / night."
+- Do NOT send instructions yourself — the function will append parking instructions automatically after reservation.
 
 TOOL protocol (strict):
 - To read parking: "TOOL: parking YYYY-MM-DD"
@@ -175,6 +205,7 @@ TOOL protocol (strict):
 After TOOL-RESULT, continue the answer using only that data.
 `.trim();
 
+    // ---- SEED pro AI ----
     const seed = [
       { role: 'system', content: rules },
       { role: 'system', content: `HOTEL: ${JSON.stringify(HOTEL)}` },
@@ -194,9 +225,6 @@ After TOOL-RESULT, continue the answer using only that data.
         const d = cmd.split(/\s+/)[1];
         result = await gsGet({ fn: 'parking', date: d });
 
-        const toolMsg = { role: 'system', content: `TOOL-RESULT: ${JSON.stringify(result)}` };
-        ai = await callOpenAI([...seed, ...messages, toolMsg]);
-
       } else if (/^reserveParking\s+/i.test(cmd)) {
         const json = cmd.replace(/^reserveParking\s+/i, '').trim();
         let payload;
@@ -206,43 +234,25 @@ After TOOL-RESULT, continue the answer using only that data.
           result = await gsPost(payload);
         }
 
-        // === NOVÉ: po úspěšném zápisu rovnou pošli potvrzení + instrukce ===
-        if (result && result.ok) {
-          const price = HOTEL?.parking?.priceEurPerNight ?? 20;
-          const i = result.summary || {};
-          const confirm =
-`✅ Rezervace parkování byla zapsána. ID: ${result.id || ''}.
-Termín: ${i.from_date} – ${i.to_date}
-Host: ${i.guest_name || ''}, SPZ: ${i.car_plate || ''}, nocí: ${i.nights || ''}.
-Cena je ${price} € / noc.
-
-**Instrukce k parkování**
-Parkování je rezervováno a nachází se **za vraty ve dvoře**. Poplatek je **${price} € / noc**.
-
-Vjezd je přes úzký průjezd (výška 220 cm, šířka 220 cm). Doporučujeme předem mrknout na Google Street View a 3D vizualizaci pro lepší orientaci:
-• 3D vizualizace hotelu (Matterport): https://my.matterport.com/show/?m=PTEAUeUbMno
-
-Tip: Pokud přijedete z horní strany ulice, projeďte blok dokola a přijeďte k nám „zpoza rohu“. Nebudou za vámi auta a můžete si najet kolmo k průjezdu; klidně využijte protisměrný pruh, ať máte lepší nájezd. Průjezdem pomalu vjeďte na dvůr – parkování je hned za vraty.
-
-Máte-li jakékoli otázky, klidně napište.`;
-
-          // Vracíme rovnou hotovou zprávu, bez dalšího kola k AI.
-          return new Response(JSON.stringify({ reply: confirm }), {
-            status: 200, headers: { 'content-type': 'application/json' }
-          });
-        }
-
-        // pokud zápis selhal, pošleme AI TOOL-RESULT a necháme ji vysvětlit chybu
-        const toolMsg = { role: 'system', content: `TOOL-RESULT: ${JSON.stringify(result)}` };
-        ai = await callOpenAI([...seed, ...messages, toolMsg]);
-
       } else {
-        // neznámý TOOL – pošli AI, aby odpověděla lidsky
-        const toolMsg = { role: 'system', content: `TOOL-RESULT: {"ok":false,"error":"unknown tool cmd"}` };
-        ai = await callOpenAI([...seed, ...messages, toolMsg]);
+        result = { ok:false, error:'unknown tool cmd' };
+      }
+
+      const toolMsg = { role: 'system', content: `TOOL-RESULT: ${JSON.stringify(result)}` };
+      ai = await callOpenAI([...seed, ...messages, toolMsg]);
+
+      // === NOVÉ: když se rezervace povedla, přidej instrukce + fotky ===
+      const okReservation = result && result.ok && result.id;
+      if (okReservation) {
+        const instr = await translateIfNeeded(parkingInstructionsCZ, messages);
+        const withMedia = `${ai}\n\n---\n${instr}${mediaBlock()}`;
+        return new Response(JSON.stringify({ reply: withMedia }), {
+          status: 200, headers: { 'content-type': 'application/json' }
+        });
       }
     }
 
+    // Bez TOOLu, nebo rezervace se nepovedla → běžná odpověď
     return new Response(JSON.stringify({ reply: ai || 'No reply.' }), {
       status: 200, headers: { 'content-type': 'application/json' }
     });
