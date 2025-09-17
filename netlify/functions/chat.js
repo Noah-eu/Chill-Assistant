@@ -1,8 +1,8 @@
 // netlify/functions/chat.js
-// Stabilní verze s opravou rozsahu typu "20. až 24.8.2025" (první jen den, druhé celé)
-// + vyhodnocení nocí jako [arrival .. departure) a rezervace bez TOOL vrstvy.
+// OPRAVA: podporuje i zápis "20-24.9[.2025]" (rozsah dnů v jednom měsíci)
+// + stabilní rozsah, 0 nocí se už nestane u "20-24.9", správně: 2025-09-20 → 2025-09-24 (4 noci)
 
-const TRANSLATE_INSTRUCTIONS = true;
+const TRANSLATE_INSTRUCTIONS = false; // zapni pokud chceš instrukce překládat do jazyka hosta
 
 export default async (req) => {
   try {
@@ -22,7 +22,7 @@ export default async (req) => {
     // ---- PUBLIC data ----
     const base = new URL(req.url);
     async function loadJSON(path) {
-      const r = await fetch(new URL(path, base.origin).toString(), { headers: { 'cache-control': 'no-cache' } });
+      const r = await fetch(new URL(path, base.origin), { headers: { 'cache-control': 'no-cache' } });
       if (!r.ok) throw new Error(`${path} ${r.status}`);
       return await r.json();
     }
@@ -54,23 +54,55 @@ export default async (req) => {
     const dim = (y,m) => new Date(y, m, 0).getDate();
     const clamp = (y,m,d) => Math.min(d, dim(y,m));
 
-    // Parse variants: "20.-24. 8. 2025", "20. až 24.8.2025", "20-24.9.", "20/9/2025–24/9/2025" apod.
+    // === NOVÝ robustní parser ===
+    // Pokrývá:
+    // 1) DD–DD.MM[.YYYY]  (např. "20-24.9", "20.–24. 9. 2025")
+    // 2) DD.MM[.YYYY] ... DD.MM[.YYYY]
+    // 3) "lone day" + plné datum (např. "20. až 24.8.2025")
     function parseDatesSmart(text) {
       const now = new Date();
       const CY = now.getFullYear();
       const CM = now.getMonth() + 1;
 
-      // plná data: den .-/ měsíc [ .-/ rok]
+      const clean = (text || '').trim();
+
+      // 1) DD–DD.MM[.YYYY]
+      //    skupiny: d1, d2, m, y?
+      const reRangeOneMonth =
+        /(^|[^\d])(\d{1,2})\s*[-–]\s*(\d{1,2})\s*[.\s]\s*(\d{1,2})(?:\s*[.\-\/]\s*(\d{2,4}))?(\D|$)/i;
+      const rm = clean.match(reRangeOneMonth);
+      if (rm) {
+        const d1 = Number(rm[2]); const d2 = Number(rm[3]);
+        const m  = Number(rm[4]);
+        let y = rm[5] ? (rm[5].length === 2 ? (Number(rm[5]) > 50 ? 1900 + Number(rm[5]) : 2000 + Number(rm[5])) : Number(rm[5])) : null;
+        if (!y) y = CY;
+
+        const a = { y, mo: m, d: clamp(y, m, Math.min(d1, d2)) };
+        const b = { y, mo: m, d: clamp(y, m, Math.max(d1, d2)) };
+
+        // Pokud rok není uveden a měsíc je menší než aktuální, doptáme se jen tehdy,
+        // když v celé větě není explicitní "tento měsíc/příští rok" (řešíme jinde),
+        // jinak bereme aktuální rok.
+        if (!rm[5] && m < CM) {
+          const ask =
+            `Zadal jste měsíc, který už proběhl. Myslíte spíš **${fmtISO(CY, CM, clamp(CY, CM, a.d))} až ${fmtISO(CY, CM, clamp(CY, CM, b.d))}** (tento měsíc), ` +
+            `nebo **${fmtISO(CY+1, m, clamp(CY+1, m, a.d))} až ${fmtISO(CY+1, m, clamp(CY+1, m, b.d))}** (příští rok)?`;
+          return { confirmed: null, ask };
+        }
+        const isoA = fmtISO(a.y, a.mo, a.d);
+        const isoB = fmtISO(b.y, b.mo, b.d);
+        return { confirmed: { from: isoA, to: isoB }, ask: null };
+      }
+
+      // 2) Dvě plná data (DD.MM[.YYYY] ... DD.MM[.YYYY])
       const reFull = /(\d{1,2})\s*[.\-\/]\s*(\d{1,2})(?:\s*[.\-\/]\s*(\d{2,4}))?/g;
       const full = [];
       let m;
-      while ((m = reFull.exec(text)) !== null) {
+      while ((m = reFull.exec(clean)) !== null) {
         let [, d, mo, y] = m;
         let year = y ? (y.length === 2 ? (Number(y) > 50 ? 1900 + Number(y) : 2000 + Number(y)) : Number(y)) : null;
         full.push({ d: Number(d), mo: Number(mo), y: year, hadYear: !!y, index: m.index });
       }
-
-      // Pokud máme dvě a více plných dat → normálně poskládej rozsah
       if (full.length >= 2) {
         const A = full[0], B = full[1];
         const a = { y: A.y ?? CY, mo: A.mo ?? CM, d: clamp(A.y ?? CY, A.mo ?? CM, A.d) };
@@ -78,10 +110,10 @@ export default async (req) => {
         const isoA = fmtISO(a.y, a.mo, a.d);
         const isoB = fmtISO(b.y, b.mo, b.d);
 
-        // doptání jen když **ani jedno** datum nemá rok a měsíc je v minulosti
         const anyYear = A.hadYear || B.hadYear;
         if (!anyYear && a.mo < CM) {
-          const ask = `Zadal jste měsíc, který už proběhl. Myslíte spíš **${fmtISO(CY, CM, clamp(CY, CM, a.d))} až ${fmtISO(CY, CM, clamp(CY, CM, b.d))}** (tento měsíc), nebo **${fmtISO(CY+1, a.mo, clamp(CY+1, a.mo, a.d))} až ${fmtISO(CY+1, b.mo, clamp(CY+1, b.mo, b.d))}** (příští rok)?`;
+          const ask = `Zadal jste měsíc, který už proběhl. Myslíte spíš **${fmtISO(CY, CM, clamp(CY, CM, a.d))} až ${fmtISO(CY, CM, clamp(CY, CM, b.d))}** (tento měsíc), `+
+                      `nebo **${fmtISO(CY+1, a.mo, clamp(CY+1, a.mo, a.d))} až ${fmtISO(CY+1, b.mo, clamp(CY+1, b.mo, b.d))}** (příští rok)?`;
           return { confirmed: null, ask };
         }
         const from = isoA <= isoB ? isoA : isoB;
@@ -89,36 +121,28 @@ export default async (req) => {
         return { confirmed: { from, to }, ask: null };
       }
 
-      // Pokud máme jen JEDNO plné datum → zkus před ním najít "osamělý den"
+      // 3) "lone day" + plné datum (např. "20. až 24.8.2025")
       if (full.length === 1) {
-        const B = full[0]; // kompletní konec 24.8.2025
-        // den před "až" / "az" / "to"
-        const loneDayRe = /(^|\D)(\d{1,2})\s*[.\s]*?(?=(?:až|az|to)\b)/i;
-        const left = text.slice(0, B.index); // jen text před nalezeným kompletním datem
+        const B = full[0];
+        const loneDayRe = /(^|\D)(\d{1,2})\s*[. ]*(?=(?:až|az|to|–|-)\b)/i;
+        const left = clean.slice(0, B.index);
         const mm = left.match(loneDayRe);
         if (mm) {
           const d1 = Number(mm[2]);
-          const a = { y: B.y ?? CY, mo: B.mo ?? CM, d: clamp(B.y ?? CY, B.mo ?? CM, d1) };
-          const b = { y: B.y ?? CY, mo: B.mo ?? CM, d: clamp(B.y ?? CY, B.mo ?? CM, B.d) };
-          const isoA = fmtISO(a.y, a.mo, a.d);
-          const isoB = fmtISO(b.y, b.mo, b.d);
-
-          // doptání pouze pokud NEbyl uveden rok ani u B a měsíc je v minulosti
-          if (!B.hadYear && a.mo < CM) {
-            const ask = `Zadal jste měsíc, který už proběhl. Myslíte spíš **${fmtISO(CY, CM, clamp(CY, CM, a.d))} až ${fmtISO(CY, CM, clamp(CY, CM, b.d))}** (tento měsíc), nebo **${fmtISO(CY+1, a.mo, clamp(CY+1, a.mo, a.d))} až ${fmtISO(CY+1, b.mo, clamp(CY+1, b.mo, b.d))}** (příští rok)?`;
+          const y = B.y ?? CY, mth = B.mo ?? CM;
+          const a = { y, mo: mth, d: clamp(y, mth, Math.min(d1, B.d)) };
+          const b = { y, mo: mth, d: clamp(y, mth, Math.max(d1, B.d)) };
+          if (!B.hadYear && mth < CM) {
+            const ask = `Zadal jste měsíc, který už proběhl. Myslíte spíš **${fmtISO(CY, CM, clamp(CY, CM, a.d))} až ${fmtISO(CY, CM, clamp(CY, CM, b.d))}** (tento měsíc), `+
+                        `nebo **${fmtISO(CY+1, mth, clamp(CY+1, mth, a.d))} až ${fmtISO(CY+1, mth, clamp(CY+1, mth, b.d))}** (příští rok)?`;
             return { confirmed: null, ask };
           }
-          const from = isoA <= isoB ? isoA : isoB;
-          const to   = isoA <= isoB ? isoB : isoA;
-          return { confirmed: { from, to }, ask: null };
+          const isoA = fmtISO(a.y, a.mo, a.d);
+          const isoB = fmtISO(b.y, b.mo, b.d);
+          return { confirmed: { from: isoA, to: isoB }, ask: null };
         }
-        // žádný osamělý den → máme jen jeden bod → chovej se jako „jednodenní dotaz“
-        const a = { y: B.y ?? CY, mo: B.mo ?? CM, d: clamp(B.y ?? CY, B.mo ?? CM, B.d) };
-        const iso = fmtISO(a.y, a.mo, a.d);
-        return { confirmed: { from: iso, to: iso }, ask: null }; // 0 nocí, ale konzistentní
       }
 
-      // nic nenašlo
       return { confirmed: null, ask: null };
     }
 
@@ -148,7 +172,6 @@ export default async (req) => {
     const lastUserText = [...messages].reverse().find(m => m.role === 'user')?.content || '';
     let parsed = parseDatesSmart(lastUserText);
 
-    // zpracuj potvrzení "tento měsíc / příští rok" (když nebyl ještě confirmed)
     if (!parsed.confirmed) {
       const choice = detectChoice(lastUserText);
       if (choice) {
@@ -173,7 +196,7 @@ export default async (req) => {
       }
     }
 
-    // ---- Dostupnost (počítáme NOCI: [from .. to))
+    // ---- Dostupnost: počítáme NOCI (arrival..departure)
     let AVAILABILITY = null;
     if (parsed.confirmed) {
       const { from, to } = parsed.confirmed;
@@ -204,12 +227,12 @@ ${lines.join('\n')}
 ${allFree
   ? '\nVšechny noci mají volno. Pošlete prosím jméno hosta, SPZ a čas příjezdu (HH:mm).'
   : anyFull
-    ? '\nNěkteré noci jsou plné. Můžeme hledat jiný termín nebo navrhnout alternativy (mrparkit.com).'
+    ? '\nNěkteré noci jsou plné. Můžeme hledat jiný termín nebo doporučit alternativy (mrparkit.com).'
     : '\nU některých nocí chybí data, dostupnost je potřeba potvrdit.'}`
       };
     }
 
-    // ---- detail parsing: jméno, SPZ, čas z poslední user zprávy
+    // ---- extrakce detailů z poslední user zprávy
     function extractDetails(msgs) {
       const t = ([...msgs].reverse().find(m => m.role === 'user')?.content || '').trim();
       if (!t) return null;
@@ -271,8 +294,8 @@ Na dvoře/parkovišti je hlavní vchod.
       return `\n\n**Fotky / mapa / animace:**\n${lines.join('\n')}`;
     }
 
-    // === REZERVACE: máme potvrzený rozsah i detaily a všechny noci volné → zapiš
-    if (AVAILABILITY && AVAILABILITY.allFree && details && details.guest_name && details.car_plate) {
+    // === REZERVACE
+    if (AVAILABILITY && AVAILABILITY.allFree && AVAILABILITY.nights > 0 && details && details.guest_name && details.car_plate) {
       try {
         const payload = {
           fn: 'reserveParking',
@@ -315,14 +338,13 @@ ${instr}${mediaBlock()}`;
       }
     }
 
-    // === Není co zapisovat → sděl dostupnost / vyžádej detaily
+    // === sdělení dostupnosti / vyžádání detailů
     if (AVAILABILITY) {
       return new Response(JSON.stringify({ reply: AVAILABILITY.text }), {
         status: 200, headers: { 'content-type': 'application/json' }
       });
     }
 
-    // === potřeba upřesnit
     if (!parsed.confirmed && parsed.ask) {
       return new Response(JSON.stringify({ reply: parsed.ask }), {
         status: 200, headers: { 'content-type': 'application/json' }
