@@ -1,12 +1,8 @@
 // netlify/functions/chat.js
-// Stabilní verze:
-// - spolehlivý výpočet rozsahu nocí [arrival .. departure)
-// - deterministické načítání dostupnosti z Sheets
-// - když máme jméno + SPZ + čas → rovnou voláme reserveParking (bez TOOL)
-// - čitelné chybové hlášky z Apps Script
-// - po úspěchu pošleme instrukce + odkazy na fotky (volitelně přeložíme)
+// Stabilní verze s opravou rozsahu typu "20. až 24.8.2025" (první jen den, druhé celé)
+// + vyhodnocení nocí jako [arrival .. departure) a rezervace bez TOOL vrstvy.
 
-const TRANSLATE_INSTRUCTIONS = false;
+const TRANSLATE_INSTRUCTIONS = true;
 
 export default async (req) => {
   try {
@@ -58,47 +54,72 @@ export default async (req) => {
     const dim = (y,m) => new Date(y, m, 0).getDate();
     const clamp = (y,m,d) => Math.min(d, dim(y,m));
 
-    // Parse "20.-25. 9", "20-24.9.2025" apod.
+    // Parse variants: "20.-24. 8. 2025", "20. až 24.8.2025", "20-24.9.", "20/9/2025–24/9/2025" apod.
     function parseDatesSmart(text) {
       const now = new Date();
       const CY = now.getFullYear();
       const CM = now.getMonth() + 1;
 
-      const re = /(\d{1,2})\s*[.\-\/]\s*(\d{1,2})(?:\s*[.\-\/]\s*(\d{2,4}))?/g;
-      const hits = [];
+      // plná data: den .-/ měsíc [ .-/ rok]
+      const reFull = /(\d{1,2})\s*[.\-\/]\s*(\d{1,2})(?:\s*[.\-\/]\s*(\d{2,4}))?/g;
+      const full = [];
       let m;
-      while ((m = re.exec(text)) !== null) {
+      while ((m = reFull.exec(text)) !== null) {
         let [, d, mo, y] = m;
         let year = y ? (y.length === 2 ? (Number(y) > 50 ? 1900 + Number(y) : 2000 + Number(y)) : Number(y)) : null;
-        hits.push({ d: Number(d), mo: Number(mo), y: year, hadYear: !!y });
-      }
-      if (hits.length === 0) return { confirmed: null, ask: null };
-
-      const A = hits[0];
-      const B = hits[1] || hits[0];
-
-      if (!A.y) A.y = CY;
-      if (!B.y) B.y = A.y;
-      if (!A.mo && B.mo) A.mo = B.mo;
-      if (!B.mo && A.mo) B.mo = A.mo;
-      if (!A.mo) A.mo = CM;
-      if (!B.mo) B.mo = A.mo;
-
-      const a = { y: A.y, mo: A.mo, d: clamp(A.y, A.mo, A.d) };
-      const b = { y: B.y, mo: B.mo, d: clamp(B.y, B.mo, B.d) };
-
-      const isoA = fmtISO(a.y, a.mo, a.d);
-      const isoB = fmtISO(b.y, b.mo, b.d);
-
-      // měsíc bez roku a měsíc je v minulosti => doptat
-      if (!A.hadYear && a.mo < CM) {
-        const ask = `Zadal jste měsíc, který už proběhl. Myslíte spíš **${fmtISO(CY, CM, clamp(CY, CM, a.d))} až ${fmtISO(CY, CM, clamp(CY, CM, b.d))}** (tento měsíc), nebo **${fmtISO(CY+1, a.mo, clamp(CY+1, a.mo, a.d))} až ${fmtISO(CY+1, b.mo, clamp(CY+1, b.mo, b.d))}** (příští rok)? Odpovězte "tento měsíc" / "příští rok", nebo napište přesná ISO data.`;
-        return { confirmed: null, ask, base: { a, b } };
+        full.push({ d: Number(d), mo: Number(mo), y: year, hadYear: !!y, index: m.index });
       }
 
-      const from = isoA <= isoB ? isoA : isoB;
-      const to   = isoA <= isoB ? isoB : isoA;
-      return { confirmed: { from, to }, ask: null };
+      // Pokud máme dvě a více plných dat → normálně poskládej rozsah
+      if (full.length >= 2) {
+        const A = full[0], B = full[1];
+        const a = { y: A.y ?? CY, mo: A.mo ?? CM, d: clamp(A.y ?? CY, A.mo ?? CM, A.d) };
+        const b = { y: B.y ?? (A.y ?? CY), mo: B.mo ?? (A.mo ?? CM), d: clamp(B.y ?? (A.y ?? CY), B.mo ?? (A.mo ?? CM), B.d) };
+        const isoA = fmtISO(a.y, a.mo, a.d);
+        const isoB = fmtISO(b.y, b.mo, b.d);
+
+        // doptání jen když **ani jedno** datum nemá rok a měsíc je v minulosti
+        const anyYear = A.hadYear || B.hadYear;
+        if (!anyYear && a.mo < CM) {
+          const ask = `Zadal jste měsíc, který už proběhl. Myslíte spíš **${fmtISO(CY, CM, clamp(CY, CM, a.d))} až ${fmtISO(CY, CM, clamp(CY, CM, b.d))}** (tento měsíc), nebo **${fmtISO(CY+1, a.mo, clamp(CY+1, a.mo, a.d))} až ${fmtISO(CY+1, b.mo, clamp(CY+1, b.mo, b.d))}** (příští rok)?`;
+          return { confirmed: null, ask };
+        }
+        const from = isoA <= isoB ? isoA : isoB;
+        const to   = isoA <= isoB ? isoB : isoA;
+        return { confirmed: { from, to }, ask: null };
+      }
+
+      // Pokud máme jen JEDNO plné datum → zkus před ním najít "osamělý den"
+      if (full.length === 1) {
+        const B = full[0]; // kompletní konec 24.8.2025
+        // den před "až" / "az" / "to"
+        const loneDayRe = /(^|\D)(\d{1,2})\s*[.\s]*?(?=(?:až|az|to)\b)/i;
+        const left = text.slice(0, B.index); // jen text před nalezeným kompletním datem
+        const mm = left.match(loneDayRe);
+        if (mm) {
+          const d1 = Number(mm[2]);
+          const a = { y: B.y ?? CY, mo: B.mo ?? CM, d: clamp(B.y ?? CY, B.mo ?? CM, d1) };
+          const b = { y: B.y ?? CY, mo: B.mo ?? CM, d: clamp(B.y ?? CY, B.mo ?? CM, B.d) };
+          const isoA = fmtISO(a.y, a.mo, a.d);
+          const isoB = fmtISO(b.y, b.mo, b.d);
+
+          // doptání pouze pokud NEbyl uveden rok ani u B a měsíc je v minulosti
+          if (!B.hadYear && a.mo < CM) {
+            const ask = `Zadal jste měsíc, který už proběhl. Myslíte spíš **${fmtISO(CY, CM, clamp(CY, CM, a.d))} až ${fmtISO(CY, CM, clamp(CY, CM, b.d))}** (tento měsíc), nebo **${fmtISO(CY+1, a.mo, clamp(CY+1, a.mo, a.d))} až ${fmtISO(CY+1, b.mo, clamp(CY+1, b.mo, b.d))}** (příští rok)?`;
+            return { confirmed: null, ask };
+          }
+          const from = isoA <= isoB ? isoA : isoB;
+          const to   = isoA <= isoB ? isoB : isoA;
+          return { confirmed: { from, to }, ask: null };
+        }
+        // žádný osamělý den → máme jen jeden bod → chovej se jako „jednodenní dotaz“
+        const a = { y: B.y ?? CY, mo: B.mo ?? CM, d: clamp(B.y ?? CY, B.mo ?? CM, B.d) };
+        const iso = fmtISO(a.y, a.mo, a.d);
+        return { confirmed: { from: iso, to: iso }, ask: null }; // 0 nocí, ale konzistentní
+      }
+
+      // nic nenašlo
+      return { confirmed: null, ask: null };
     }
 
     function findLastDatesInHistory(msgs) {
@@ -108,8 +129,7 @@ export default async (req) => {
         if (m.role !== 'user') continue;
         re.lastIndex = 0;
         const t = m.content || '';
-        const h1 = re.exec(t);
-        if (!h1) continue;
+        const h1 = re.exec(t); if (!h1) continue;
         const h2 = re.exec(t);
         const d1 = Number(h1[1]), mo1 = Number(h1[2]), y1 = h1[3] ? Number(h1[3]) : null;
         let d2 = d1, mo2 = mo1, y2 = y1;
@@ -128,7 +148,7 @@ export default async (req) => {
     const lastUserText = [...messages].reverse().find(m => m.role === 'user')?.content || '';
     let parsed = parseDatesSmart(lastUserText);
 
-    // volba "tento měsíc / příští rok"
+    // zpracuj potvrzení "tento měsíc / příští rok" (když nebyl ještě confirmed)
     if (!parsed.confirmed) {
       const choice = detectChoice(lastUserText);
       if (choice) {
@@ -153,7 +173,7 @@ export default async (req) => {
       }
     }
 
-    // ---- Dostupnost (pro NOCI: [from .. to) — den odjezdu se NEpočítá)
+    // ---- Dostupnost (počítáme NOCI: [from .. to))
     let AVAILABILITY = null;
     if (parsed.confirmed) {
       const { from, to } = parsed.confirmed;
@@ -197,13 +217,11 @@ ${allFree
       const arrival = timeMatch ? timeMatch[1].replace('.', ':') : null;
       const parts = t.split(/[,;\n]/).map(s => s.trim()).filter(Boolean);
 
-      // SPZ: cokoliv s min. 5 znaky písmen/cifer bez mezer
       let plate = null;
       for (const p of parts) {
         const c = p.replace(/\s+/g,'');
         if (/^[A-Za-z0-9-]{5,}$/.test(c)) { plate = c.toUpperCase(); break; }
       }
-      // jméno: první část, která není čas ani SPZ
       let name = null;
       for (const p of parts) {
         const clean = p.replace(/\s+/g,' ').trim();
@@ -217,7 +235,7 @@ ${allFree
 
     const details = extractDetails(messages);
 
-    // ---- OpenAI helper (jen na textový výstup; logiku děláme sami)
+    // ---- OpenAI helper (jen text)
     async function callOpenAI(msgs) {
       const r = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
@@ -253,7 +271,7 @@ Na dvoře/parkovišti je hlavní vchod.
       return `\n\n**Fotky / mapa / animace:**\n${lines.join('\n')}`;
     }
 
-    // === REZERVACE: když je potvrzený rozsah a máme detaily + všechno volné → rovnou zapiš
+    // === REZERVACE: máme potvrzený rozsah i detaily a všechny noci volné → zapiš
     if (AVAILABILITY && AVAILABILITY.allFree && details && details.guest_name && details.car_plate) {
       try {
         const payload = {
@@ -297,21 +315,20 @@ ${instr}${mediaBlock()}`;
       }
     }
 
-    // === Není co zapisovat → sděl dostupnost nebo vyžádej detaily
+    // === Není co zapisovat → sděl dostupnost / vyžádej detaily
     if (AVAILABILITY) {
       return new Response(JSON.stringify({ reply: AVAILABILITY.text }), {
         status: 200, headers: { 'content-type': 'application/json' }
       });
     }
 
-    // === Stále chybí upřesnění dat
+    // === potřeba upřesnit
     if (!parsed.confirmed && parsed.ask) {
       return new Response(JSON.stringify({ reply: parsed.ask }), {
         status: 200, headers: { 'content-type': 'application/json' }
       });
     }
 
-    // fallback
     return new Response(JSON.stringify({ reply: 'Jak vám mohu pomoci?' }), {
       status: 200, headers: { 'content-type': 'application/json' }
     });
