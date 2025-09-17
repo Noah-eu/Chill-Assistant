@@ -1,28 +1,32 @@
 // netlify/functions/chat.js
-// - Rozsah dat = příjezd ve "from" a odjezd v "to" => počítají se noci [from .. to) (den odjezdu se NEpočítá)
-// - Předpočítaná denní dostupnost pro noci [from .. to)
-// - AI MUSÍ nejdřív vypsat AVAILABILITY_TEXT (den-po-dni), pak pokračuje dotazy/rezervací
-// - Po úspěšné rezervaci: instrukce + fotky (Markdown <img>)
-// - Smart parsing dat + doptání u minulého měsíce bez roku
+// - Smart parsování dat (řeší i minulý měsíc bez roku)
+// - Čte kapacitu z Apps Script (GET fn=parking&date=YYYY-MM-DD)
+// - Rozsah [from .. to) = den odjezdu se NEpočítá
+// - Deterministická dostupnost (žádné hádání AI)
+// - Zápis rezervace (POST fn=reserveParking {...})
+// - Po úspěšné rezervaci přidá CZ instrukce + fotky z /data/parking_media.json
+// - (Volitelně) umí překládat instrukce do jazyka uživatele
 
-const TRANSLATE_INSTRUCTIONS = false;
+const TRANSLATE_INSTRUCTIONS = false; // přepni na true, chceš-li překládat
 
 export default async (req) => {
   try {
-    if (req.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
+    if (req.method !== 'POST') {
+      return new Response('Method Not Allowed', { status: 405 });
+    }
 
-    // ---- BODY ----
+    // ---- body ----
     let body = {};
     try { body = await req.json(); } catch { return new Response('Bad JSON body', { status: 400 }); }
     const { messages = [] } = body;
 
-    // ---- ENV ----
+    // ---- env ----
     const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
     const SHEETS_API_URL = process.env.SHEETS_API_URL;
     if (!OPENAI_API_KEY) return new Response('Missing OPENAI_API_KEY', { status: 500 });
     if (!SHEETS_API_URL) return new Response('Missing SHEETS_API_URL', { status: 500 });
 
-    // ---- PUBLIC data ----
+    // ---- public data ----
     const base = new URL(req.url);
     async function loadJSON(path) {
       const url = new URL(path, `${base.origin}`).toString();
@@ -51,20 +55,21 @@ export default async (req) => {
       return await r.json();
     }
 
-    // ---- Date utils ----
-    const toISODate = (d) => d.toISOString().slice(0, 10);
-    const fmtISO    = (y,m,d) => `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
-    const daysInMonth = (y,m) => new Date(y, m, 0).getDate();
-    const clampDay = (y,m,d) => Math.min(d, daysInMonth(y,m));
+    // ---- date utils ----
+    const toISODate  = (d) => d.toISOString().slice(0, 10);
+    const fmtISO     = (y,m,d) => `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+    const daysInMonth= (y,m) => new Date(y, m, 0).getDate();
+    const clampDay   = (y,m,d) => Math.min(d, daysInMonth(y,m));
 
-    // ---- Smart parse ----
+    // smart parser: "20.-25.9.", "17-19.8", "12.9.2025"…
     function parseDatesSmart(text) {
       const now = new Date();
       const CY = now.getFullYear();
       const CM = now.getMonth() + 1;
+
       const re = /(\d{1,2})\s*[.\-\/]\s*(\d{1,2})(?:\s*[.\-\/]\s*(\d{2,4}))?/g;
 
-      const hits = [];
+      let hits = [];
       let m;
       while ((m = re.exec(text)) !== null) {
         let [ , d, mo, y ] = m;
@@ -89,11 +94,12 @@ export default async (req) => {
       const isoA = fmtISO(Aa.y, Aa.mo, Aa.d);
       const isoB = fmtISO(Bb.y, Bb.mo, Bb.d);
 
+      // pokud neuvedl rok a měsíc by už proběhl → doptat se
       if (!A.hadYear && Aa.mo < CM) {
-        const nextYearA = fmtISO(CY + 1, Aa.mo, clampDay(CY+1, Aa.mo, Aa.d));
-        const nextYearB = fmtISO(CY + 1, Bb.mo, clampDay(CY+1, Bb.mo, Bb.d));
-        const thisMonthA = fmtISO(CY, CM, clampDay(CY, CM, Aa.d));
-        const thisMonthB = fmtISO(CY, CM, clampDay(CY, CM, Bb.d));
+        const nextYearA   = fmtISO(CY + 1, Aa.mo, clampDay(CY+1, Aa.mo, Aa.d));
+        const nextYearB   = fmtISO(CY + 1, Bb.mo, clampDay(CY+1, Bb.mo, Bb.d));
+        const thisMonthA  = fmtISO(CY, CM, clampDay(CY, CM, Aa.d));
+        const thisMonthB  = fmtISO(CY, CM, clampDay(CY, CM, Bb.d));
         const ask = `Zadal jste měsíc, který už proběhl. Myslíte spíš **${thisMonthA} až ${thisMonthB}** (tento měsíc), nebo **${nextYearA} až ${nextYearB}** (příští rok)? Odpovězte prosím "tento měsíc" nebo "příští rok", případně napište přesná data.`;
         return { confirmed: null, ask };
       }
@@ -103,6 +109,7 @@ export default async (req) => {
       return { confirmed: { from, to }, ask: null };
     }
 
+    // poslední user text → pokus vyčíst rozsah
     const lastUserText = [...messages].reverse().find(m => m.role === 'user')?.content || '';
     const parsed = parseDatesSmart(lastUserText);
 
@@ -112,50 +119,54 @@ export default async (req) => {
       });
     }
 
-    // ---- Přednačtení denních dat pro noci [from .. to) ----
-    let PARKING_RANGE = null;
-    let PARKING_LIST = [];
+    // ---- přednačtení dostupnosti [from .. to) (den odjezdu se NEzapočítá) ----
+    let AVAILABILITY = null;
     if (parsed.confirmed) {
       const { from, to } = parsed.confirmed;
-      const out = {};
-      let cur = new Date(from + 'T00:00:00Z');     // včetně from
-      const end = new Date(to + 'T00:00:00Z');     // exkluzivně to
-      while (cur < end) {
+
+      const out = [];
+      const start = new Date(from + 'T00:00:00Z');
+      const end   = new Date(to   + 'T00:00:00Z'); // exkluzivní
+
+      for (let cur = new Date(start); cur < end; cur.setUTCDate(cur.getUTCDate() + 1)) {
         const dISO = toISODate(cur);
         try {
           const day = await gsGet({ fn: 'parking', date: dISO });
-          out[dISO] = day;
-          if (day && day.ok) {
-            PARKING_LIST.push({
-              date: dISO,
-              total: Number(day.total_spots || 0),
-              booked: Number(day.booked || 0),
-              free: Math.max(0, Number(day.total_spots || 0) - Number(day.booked || 0))
-            });
-          } else {
-            PARKING_LIST.push({ date: dISO, total: null, booked: null, free: null, error: day?.error || 'unknown' });
-          }
+          out.push({ date: dISO, ok: !!day.ok, total: day.total_spots ?? null, booked: day.booked ?? null, free: day.free ?? null, note: day.note ?? '' });
         } catch (e) {
-          out[dISO] = { ok:false, error:String(e) };
-          PARKING_LIST.push({ date: dISO, total: null, booked: null, free: null, error: String(e) });
+          out.push({ date: dISO, ok: false, error: String(e) });
         }
-        cur.setUTCDate(cur.getUTCDate() + 1);
       }
-      PARKING_RANGE = { from, to, nights: PARKING_LIST.length, days: out };
-    }
 
-    // ---- Dostupnost: deterministický text (den-po-dni) ----
-    function buildAvailabilityText(list, range) {
-      if (!list || list.length === 0 || !range) return '';
-      const header = `Rozsah chápeme jako příjezd **${range.from}** a odjezd **${range.to}** ⇒ nocí: **${list.length}** (počítají se noci [from..to) – den odjezdu se neúčtuje).`;
-      const lines = list.map(d => {
-        if (d.free === null || d.free === undefined) return `• ${d.date}: dostupnost k potvrzení`;
-        if (d.free === 0) return `• ${d.date}: plně obsazeno`;
-        return `• ${d.date}: volná místa ${d.free} (z ${d.total})`;
-      });
-      return [header, 'Dostupnost po dnech:', ...lines].join('\n');
+      // deterministický text
+      const lines = out.map(d => {
+        if (!d.ok) return `• ${d.date}: dostupnost neznámá`;
+        return `• ${d.date}: volná místa ${Math.max(0, Number(d.free))} (celkem ${Number(d.total)}, obsazená ${Number(d.booked)})`;
+        });
+      const anyFull = out.some(d => d.ok && Number(d.free) <= 0);
+      const allKnown = out.every(d => d.ok);
+      const allHaveFree = allKnown && out.every(d => Number(d.free) > 0);
+
+      let header = `Dostupnost pro **${from} → ${to}** (počítají se noci **${out.length}**: dny příjezdu až před odjezdem):\n` + lines.join('\n');
+
+      let tail;
+      if (allHaveFree) {
+        tail = `\n\nVšechny noci mají volno. Chcete rezervovat? Prosím pošlete:\n- jméno hosta\n- SPZ vozidla\n- doporučený čas příjezdu (HH:mm)`;
+      } else if (anyFull) {
+        tail = `\n\nNěkteré noci jsou plně obsazené. Můžeme hledat jiný termín, nebo zkusit alternativy (např. mrparkit.com).`;
+      } else {
+        tail = `\n\nU některých nocí nemám potvrzená data – dostupnost bude potřeba ještě ověřit.`;
+      }
+
+      AVAILABILITY = {
+        from, to,
+        nights: out.length,
+        days: out,
+        allHaveFree,
+        anyFull,
+        text: header + tail
+      };
     }
-    const AVAILABILITY_TEXT = buildAvailabilityText(PARKING_LIST, PARKING_RANGE);
 
     // ---- OpenAI helpers ----
     async function callOpenAI(msgs) {
@@ -182,72 +193,59 @@ export default async (req) => {
       return await callOpenAI(msgs);
     }
 
-    // ---- Instrukce (CZ) ----
+    // ---- Instrukce k parkování (CZ) – přesně podle zadání ----
     const parkingInstructionsCZ = `
 Parkoviště je na našem dvoře v ceně 20 eur (500 Kč) za noc. Odkud přijíždíte? Pokud od jihu, tak až zabočíte na naší ulici, zařaďte se do pravého pruhu a tam pak vyčkejte až bude silnice prázdná. Z něj pak kolmo rovnou do našeho průjezdu na dvůr. Ten průjezd je totiž dost úzký (šířka 220 cm) a z krajního pruhu se do něj nedá vjet. Pokud přijíždíte z druhé strany, objeďte radši ještě náš blok. Bude totiž za vámi velký provoz a nebude možnost zajet do průjezdu z protějšího pruhu. Pokud blok objedete, nepojede za vámi skoro nikdo.
 Na dvoře/parkovišti, je hlavní vchod.
 `.trim();
 
-    // ---- Fotky jako Markdown obrázky ----
     function mediaBlock() {
       if (!Array.isArray(MEDIA) || MEDIA.length === 0) return '';
-      const lines = MEDIA.map((m) => {
-        const url = new URL(`/${m.src}`, `${base.origin}`).toString();
-        const caption = m.caption || '';
-        return `![${caption}](${url})`;
-      });
-      return `\n\n${lines.join('\n')}`;
+      const lines = MEDIA.map((m, i) => `- ${m.caption || `Foto ${i+1}`}: ${new URL(`/${m.src}`, `${base.origin}`).toString()}`);
+      return `\n\n**Fotky / mapa / animace:**\n${lines.join('\n')}`;
     }
 
-    // ---- RULES pro AI ----
+    // ---- RULES pro AI – AI jen "verbalizuje" předpřipravená fakta ----
     const rules = `
-You are a multilingual, precise assistant for ${HOTEL.name || 'our hotel'}.
-Reply in the user's language. Never invent facts.
+You are a multilingual, precise assistant for ${HOTEL.name || 'our hotel'}. Reply in the user's language.
 
-IMPORTANT DATE RULE:
-- A range "from ... to" means arrival on "from" and departure on "to".
-- Nights counted are the half-open interval [from .. to), i.e., days from "from" up to but NOT including "to".
+DATES:
+- Ranges are hotel-nights in a half-open interval [arrival .. departure), i.e., do NOT count the departure day.
 
-When AVAILABILITY_TEXT is provided, you MUST start your reply by outputting AVAILABILITY_TEXT verbatim.
-Then continue naturally (ask for guest name, car plate, arrival time) or proceed with reservation.
+AVAILABILITY:
+- When AVAILABILITY is present, read and trust it. Never contradict it.
+- Start by restating the ISO dates and number of nights.
+- Then show per-day availability as given in AVAILABILITY_TEXT (do not invent).
+- If AVAILABILITY.allHaveFree = true → ask ONLY for: guest name, car plate, arrival time (HH:mm).
+- If any night is fully booked → say which nights are full and offer alternatives.
 
-PARKING:
-- Daily availability = free = total_spots - booked.
-- Do not mark the whole range as fully booked unless **every** night in [from..to) has free = 0.
-- If the user wants to proceed, ask ONLY: guest name, car plate (SPZ), arrival time HH:mm.
-- When the user gives those, WRITE via:
+TOOLS:
+- To write a reservation, use exactly:
   TOOL: reserveParking {"from_date":"<FROM>","to_date":"<TO>","guest_name":"John Doe","channel":"Direct","car_plate":"ABC1234","arrival_time":"18:30","note":""}
-- After successful write, reply: "✅ Reservation recorded. ID: <id>. Price is 20 € / night."
-- Do NOT send instructions yourself — the function will append instructions + photos automatically after reservation.
 
-TOOL protocol (strict):
-- To read a single day: "TOOL: parking YYYY-MM-DD" (use only when range not pre-fetched).
-- To write reservation: "TOOL: reserveParking {...JSON...}"
+AFTER TOOL-RESULT:
+- If write ok → say: "✅ Rezervace zapsána. ID: <id>. Cena je 20 € / noc."
+- The system will append parking instructions and photo links automatically.
 `.trim();
 
-    // ---- SEED ----
+    // seed zprávy
     const seed = [
       { role: 'system', content: rules },
       { role: 'system', content: `HOTEL: ${JSON.stringify(HOTEL)}` },
-      { role: 'system', content: `PARSED_RANGE: ${JSON.stringify(parsed.confirmed || null)}` },
-      { role: 'system', content: `PARKING_LIST: ${JSON.stringify(PARKING_LIST)}` },
-      { role: 'system', content: `AVAILABILITY_TEXT:\n${AVAILABILITY_TEXT}` }
+      { role: 'system', content: `AVAILABILITY_TEXT: ${AVAILABILITY ? AVAILABILITY.text : ''}` },
+      { role: 'system', content: `RANGE_META: ${JSON.stringify(AVAILABILITY ? { from: AVAILABILITY.from, to: AVAILABILITY.to, nights: AVAILABILITY.nights, allHaveFree: AVAILABILITY.allHaveFree } : null)}` }
     ];
 
-    // ---- 1. průchod AI ----
+    // první průchod
     let ai = await callOpenAI([...seed, ...messages]);
 
-    // ---- TOOL požadavek? ----
+    // pokud AI požádá o TOOL
     const mTool = /^TOOL:\s*(.+)$/im.exec(ai || '');
     if (mTool) {
       const cmd = (mTool[1] || '').trim();
       let result;
 
-      if (/^parking\s+\d{4}-\d{2}-\d{2}$/i.test(cmd)) {
-        const d = cmd.split(/\s+/)[1];
-        result = await gsGet({ fn: 'parking', date: d });
-
-      } else if (/^reserveParking\s+/i.test(cmd)) {
+      if (/^reserveParking\s+/i.test(cmd)) {
         const json = cmd.replace(/^reserveParking\s+/i, '').trim();
         let payload;
         try { payload = JSON.parse(json); } catch { result = { ok:false, error:'Bad JSON for reserveParking' }; }
@@ -255,7 +253,6 @@ TOOL protocol (strict):
           payload.fn = 'reserveParking';
           result = await gsPost(payload);
         }
-
       } else {
         result = { ok:false, error:'unknown tool cmd' };
       }
@@ -263,9 +260,8 @@ TOOL protocol (strict):
       const toolMsg = { role: 'system', content: `TOOL-RESULT: ${JSON.stringify(result)}` };
       ai = await callOpenAI([...seed, ...messages, toolMsg]);
 
-      // Po úspěšné rezervaci → instrukce + fotky
-      const okReservation = result && result.ok && result.id;
-      if (okReservation) {
+      // úspěšná rezervace → přidej instrukce + fotky
+      if (result && result.ok && result.id) {
         const instr = await translateIfNeeded(parkingInstructionsCZ, messages);
         const withMedia = `${ai}\n\n---\n${instr}${mediaBlock()}`;
         return new Response(JSON.stringify({ reply: withMedia }), {
@@ -274,8 +270,8 @@ TOOL protocol (strict):
       }
     }
 
-    // Bez TOOLu → běžná odpověď
-    return new Response(JSON.stringify({ reply: ai || 'No reply.' }), {
+    // bez TOOLu → vrať běžnou odpověď
+    return new Response(JSON.stringify({ reply: ai || (AVAILABILITY ? AVAILABILITY.text : 'Jak vám mohu pomoci?') }), {
       status: 200, headers: { 'content-type': 'application/json' }
     });
 
