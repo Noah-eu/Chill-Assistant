@@ -1,9 +1,8 @@
 // netlify/functions/chat.js
-// CHILL Assistant – jednoduchý režim: POUZE formát "DD.MM.–DD.MM.YYYY" (nebo s '-')
-// Př.: "20.09.–24.09.2025"  → from=2025-09-20, to=2025-09-24 (den odjezdu se nepočítá)
-// - Dostupnost počítá noci cur < to
-// - Když host pošle jen jméno/SPZ/čas, vezmeme poslední potvrzený rozsah z historie
-// - Po úspěšné rezervaci pošleme instrukce + fotky
+// Jednoduchý režim s pevným formátem dat: "DD.MM.–DD.MM.YYYY" (nebo s '-')
+// Př.: "20.09.–24.09.2025" → from=2025-09-20, to=2025-09-24 (den odjezdu se nepočítá)
+// NOVÉ: pokud další zpráva obsahuje jen jméno/SPZ/čas a předtím už padla dostupnost,
+//       vezme se POSLEDNÍ potvrzený rozsah z historie a rovnou se rezervuje.
 
 const TRANSLATE_INSTRUCTIONS = true;
 
@@ -60,10 +59,8 @@ export default async (req) => {
 
     // ---------- STRIKTNÍ PARSER ----------
     // Povolen jen formát: "DD.MM.–DD.MM.YYYY" nebo "DD.MM-DD.MM.YYYY"
-    // (en-dash U+2013 nebo minus -)
     function parseDatesStrict(text) {
       const t = (text || '').trim();
-      //  dd.mm . [–|-] . dd.mm . yyyy
       const re = /(^|.*?\s)\b(\d{2})\.(\d{2})\.\s*[–-]\s*(\d{2})\.(\d{2})\.(\d{4})\b/;
       const m = re.exec(t);
       if (!m) {
@@ -78,11 +75,11 @@ export default async (req) => {
       const isoA = fmtISO(a.y, a.mo, a.d);
       const isoB = fmtISO(b.y, b.mo, b.d);
       const from = isoA <= isoB ? isoA : isoB;
-      const to   = isoA <= isoB ? isoB : isoA; // den odjezdu (exkluzivní pro smyčku)
+      const to   = isoA <= isoB ? isoB : isoA; // den odjezdu (exkluzivní ve smyčce níž)
       return { confirmed: { from, to }, ask: null };
     }
 
-    // poslední potvrzený rozsah z odpovědi bota („Dostupnost pro **YYYY-MM-DD → YYYY-MM-DD**“)
+    // poslední potvrzený rozsah z odpovědi bota: „Dostupnost pro **YYYY-MM-DD → YYYY-MM-DD**“
     function rangeFromHistory(msgs) {
       for (let i = msgs.length - 1; i >= 0; i--) {
         const m = msgs[i];
@@ -118,55 +115,6 @@ export default async (req) => {
       if (!name && !plate && !arrival) return null;
       return { guest_name: name || '', car_plate: plate || '', arrival_time: arrival || '' };
     }
-
-    const lastUserText = [...messages].reverse().find(m => m.role === 'user')?.content || '';
-    let parsed = parseDatesStrict(lastUserText);
-
-    // ---------- DOSTUPNOST (počítáme NOCI: for cur < to) ----------
-    let AVAILABILITY = null;
-    if (parsed.confirmed) {
-      const { from, to } = parsed.confirmed;
-      const out = [];
-      const start = new Date(from + 'T00:00:00Z');
-      const end   = new Date(to   + 'T00:00:00Z'); // 'to' = den odjezdu
-      for (let cur = new Date(start); cur < end; cur.setUTCDate(cur.getUTCDate() + 1)) {
-        const iso = toISODate(cur);
-        try {
-          const d = await gsGet({ fn: 'parking', date: iso });
-          if (!d || !d.ok || typeof d.total_spots === 'undefined') {
-            out.push({ date: iso, ok: false });
-          } else {
-            out.push({
-              date: iso, ok: true,
-              total: Number(d.total_spots) || 0,
-              booked: Number(d.booked) || 0,
-              free: Math.max(0, Number(d.free) || 0),
-              note: String(d.note || '')
-            });
-          }
-        } catch (e) { out.push({ date: iso, ok: false, error: String(e) }); }
-      }
-      const lines = out.map(d => d.ok
-        ? `• ${d.date}: volno ${d.free} / ${d.total}${d.note ? ` (${d.note})` : ''}`
-        : `• ${d.date}: dostupnost neznámá`);
-      const allKnown = out.every(d => d.ok);
-      const allFree  = allKnown && out.every(d => d.free > 0);
-      const anyFull  = out.some(d => d.ok && d.free <= 0);
-
-      AVAILABILITY = {
-        from, to, nights: out.length, days: out, allKnown, allFree, anyFull,
-        text:
-`Dostupnost pro **${from} → ${to}** (nocí: ${out.length}, den odjezdu se nepočítá)
-${lines.join('\n')}
-${allFree
-  ? '\nVšechny noci mají volno. Pošlete prosím jméno hosta, SPZ a čas příjezdu (HH:mm).'
-  : anyFull
-    ? '\nNěkteré noci jsou plné. Můžeme hledat jiný termín nebo doporučit alternativy (mrparkit.com).'
-    : '\nU některých nocí chybí data, dostupnost je potřeba potvrdit.'}`
-      };
-    }
-
-    const details = extractDetails(messages);
 
     // ---------- Překladač (jen pro instrukce) ----------
     async function callOpenAI(msgs) {
@@ -205,21 +153,74 @@ Na dvoře/parkovišti je hlavní vchod.
       return `\n\n**Fotky / mapa / animace:**\n${lines.join('\n')}`;
     }
 
-    // ---------- Rezervace ----------
-    // a) už máme dostupnost i detaily (jméno + SPZ) → rovnou zapiš
-    if (AVAILABILITY && AVAILABILITY.allFree && AVAILABILITY.nights > 0 && details && details.guest_name && details.car_plate) {
-      // fallback: pokud uživatel neposlal znovu data, vezmeme poslední rozsah z historie
-      let from = AVAILABILITY.from, to = AVAILABILITY.to;
-      if (!from || !to) {
-        const hist = rangeFromHistory(messages);
-        if (hist) { from = hist.from; to = hist.to; }
-      }
+    // ---------- ŘÍDÍCÍ LOGIKA ----------
 
+    // 1) Zkusím vytáhnout datum z POSLEDNÍ uživatelské zprávy
+    const lastUserText = [...messages].reverse().find(m => m.role === 'user')?.content || '';
+    let parsed = parseDatesStrict(lastUserText);
+
+    // 2) Když datum v poslední zprávě není správného formátu,
+    //    ale už PŘEDTÍM bot vypsal dostupnost s rozsahem, tak si ten rozsah vezmu z historie.
+    let effectiveRange = null;
+    if (parsed.confirmed) {
+      effectiveRange = parsed.confirmed; // { from, to }
+    } else {
+      const hist = rangeFromHistory(messages);
+      if (hist) effectiveRange = hist; // umožní pokračovat po "David Eder, 4AD9111, 14:00"
+    }
+
+    // 3) Načtu dostupnost pro effectiveRange (pokud ho mám)
+    let AVAILABILITY = null;
+    if (effectiveRange) {
+      const { from, to } = effectiveRange;
+      const out = [];
+      const start = new Date(from + 'T00:00:00Z');
+      const end   = new Date(to   + 'T00:00:00Z'); // 'to' = den odjezdu (exkluzivně)
+      for (let cur = new Date(start); cur < end; cur.setUTCDate(cur.getUTCDate() + 1)) {
+        const iso = toISODate(cur);
+        try {
+          const d = await gsGet({ fn: 'parking', date: iso });
+          if (!d || !d.ok || typeof d.total_spots === 'undefined') {
+            out.push({ date: iso, ok: false });
+          } else {
+            out.push({
+              date: iso, ok: true,
+              total: Number(d.total_spots) || 0,
+              booked: Number(d.booked) || 0,
+              free: Math.max(0, Number(d.free) || 0),
+              note: String(d.note || '')
+            });
+          }
+        } catch (e) { out.push({ date: iso, ok: false, error: String(e) }); }
+      }
+      const lines = out.map(d => d.ok
+        ? `• ${d.date}: volno ${d.free} / ${d.total}${d.note ? ` (${d.note})` : ''}`
+        : `• ${d.date}: dostupnost neznámá`);
+      const allKnown = out.every(d => d.ok);
+      const allFree  = allKnown && out.every(d => d.free > 0);
+      const anyFull  = out.some(d => d.ok && d.free <= 0);
+
+      AVAILABILITY = {
+        from, to, nights: out.length, days: out, allKnown, allFree, anyFull,
+        text:
+`Dostupnost pro **${from} → ${to}** (nocí: ${out.length}, den odjezdu se nepočítá)
+${lines.join('\n')}
+${allFree
+  ? '\nVšechny noci mají volno. Pošlete prosím jméno hosta, SPZ a čas příjezdu (HH:mm).'
+  : anyFull
+    ? '\nNěkteré noci jsou plné. Můžeme hledat jiný termín nebo doporučit alternativy (mrparkit.com).'
+    : '\nU některých nocí chybí data, dostupnost je potřeba potvrdit.'}`
+      };
+    }
+
+    // 4) Pokus o rezervaci, pokud: máme dostupnost se všemi volnými nocemi + detaily od hosta
+    const details = extractDetails(messages);
+    if (AVAILABILITY && AVAILABILITY.allFree && AVAILABILITY.nights > 0 && details && details.guest_name && details.car_plate) {
       try {
         const payload = {
           fn: 'reserveParking',
-          from_date: from,
-          to_date: to,
+          from_date: AVAILABILITY.from,
+          to_date: AVAILABILITY.to,
           guest_name: details.guest_name,
           channel: 'Direct',
           car_plate: details.car_plate,
@@ -250,12 +251,12 @@ ${instr}${mediaBlock()}`;
       }
     }
 
-    // b) máme dostupnost, ale chybí detail(y) → vypiš dostupnost a vyžádej si je
+    // 5) Pokud máme dostupnost, ale chybí nějaké údaje → vypiš dostupnost / požádej o údaje
     if (AVAILABILITY) {
       return new Response(JSON.stringify({ reply: AVAILABILITY.text }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
 
-    // c) nemáme platný formát → vypiš instrukci s požadovaným formátem
+    // 6) Pokud nemáme rozsah ani z parseru ani z historie → ukaž instrukci na formát
     if (!parsed.confirmed && parsed.ask) {
       return new Response(JSON.stringify({ reply: parsed.ask }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
