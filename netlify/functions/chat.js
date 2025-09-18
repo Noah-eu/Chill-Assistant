@@ -1,8 +1,9 @@
 // netlify/functions/chat.js
-// CHILL Assistant – parking
-// - EU datumy ("20–24.9[.2025]"), den odjezdu se NEPOČÍTÁ (to = departure day, exclusive v cyklu)
-// - Po uživatelských detailech bez dat se vezme poslední potvrzený rozsah z historie
-// - Rezervace + instrukce + fotky (Markdown obrázky), volitelný překlad
+// CHILL Assistant – jednoduchý režim: POUZE formát "DD.MM.–DD.MM.YYYY" (nebo s '-')
+// Př.: "20.09.–24.09.2025"  → from=2025-09-20, to=2025-09-24 (den odjezdu se nepočítá)
+// - Dostupnost počítá noci cur < to
+// - Když host pošle jen jméno/SPZ/čas, vezmeme poslední potvrzený rozsah z historie
+// - Po úspěšné rezervaci pošleme instrukce + fotky
 
 const TRANSLATE_INSTRUCTIONS = true;
 
@@ -57,76 +58,31 @@ export default async (req) => {
     const clamp       = (y,m,d) => Math.min(Math.max(1,d), daysInMonth(y,m));
     const fmtISO      = (y,m,d) => `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
 
-    // ---------- EU parser ----------
-    // Vrací { from: YYYY-MM-DD, to: YYYY-MM-DD } kde "to" = den odjezdu (bez +1).
-    function parseDatesSmart(text) {
-      const now = new Date();
-      const CY = now.getFullYear();
-      const CM = now.getMonth() + 1;
-      const clean = (text || '').normalize('NFKC').replace(/\s+/g,' ').trim();
-
-      // 1) "DD–DD.MM[.YYYY]"
-      let m = /^.*?\b(\d{1,2})\s*[-–]\s*(\d{1,2})\s*[.\-\/ ]\s*(\d{1,2})(?:\s*[.\-\/]\s*(\d{2,4}))?\b.*$/i.exec(clean);
-      if (m) {
-        let d1 = +m[1], d2 = +m[2], mo = +m[3], y = m[4] ? +m[4] : null;
-        if (!y) y = CY;
-        if (String(y).length === 2) y = y >= 70 ? 1900 + y : 2000 + y;
-
-        if (!m[4] && mo < CM) {
-          const ask = `Zadal jste měsíc, který už proběhl. Myslíte spíš **${fmtISO(CY, CM, clamp(CY, CM, Math.min(d1,d2)))} až ${fmtISO(CY, CM, clamp(CY, CM, Math.max(d1,d2)))}** (tento měsíc), nebo **${fmtISO(CY+1, mo, clamp(CY+1, mo, Math.min(d1,d2))} až ${fmtISO(CY+1, mo, clamp(CY+1, mo, Math.max(d1,d2)))}** (příští rok)? Odpovězte prosím "tento měsíc" nebo "příští rok", případně napište přesná data.`;
-          return { confirmed: null, ask };
-        }
-        const from = fmtISO(y, mo, clamp(y, mo, Math.min(d1,d2)));
-        const to   = fmtISO(y, mo, clamp(y, mo, Math.max(d1,d2))); // den odjezdu
-        return { confirmed: { from, to }, ask: null };
+    // ---------- STRIKTNÍ PARSER ----------
+    // Povolen jen formát: "DD.MM.–DD.MM.YYYY" nebo "DD.MM-DD.MM.YYYY"
+    // (en-dash U+2013 nebo minus -)
+    function parseDatesStrict(text) {
+      const t = (text || '').trim();
+      //  dd.mm . [–|-] . dd.mm . yyyy
+      const re = /(^|.*?\s)\b(\d{2})\.(\d{2})\.\s*[–-]\s*(\d{2})\.(\d{2})\.(\d{4})\b/;
+      const m = re.exec(t);
+      if (!m) {
+        const ask = 'Pro rezervaci parkování mi prosím napište datum **pouze** v tomto formátu:\n\n' +
+                    '**DD.MM.–DD.MM.YYYY** (např. **20.09.–24.09.2025**)\n\n' +
+                    'Použijte buď pomlčku "-", nebo en-dash "–" mezi dny.';
+        return { confirmed: null, ask };
       }
-
-      // 2) Dvě plná data "DD.MM[.YYYY] ... DD.MM[.YYYY]"
-      const reFull = /(\d{1,2})\s*[.\-\/]\s*(\d{1,2})(?:\s*[.\-\/]\s*(\d{2,4}))?/g;
-      const list = [];
-      let mm;
-      while ((mm = reFull.exec(clean)) !== null) {
-        let [, d, mo, y] = mm;
-        let year = y ? (String(y).length === 2 ? (+y > 50 ? 1900 + +y : 2000 + +y) : +y) : null;
-        list.push({ d:+d, mo:+mo, y:year, hadYear:!!y, idx:mm.index });
-      }
-      if (list.length >= 2) {
-        const A = list[0], B = list[1];
-        const aY = A.y ?? CY, bY = B.y ?? (A.y ?? CY);
-        const aM = A.mo ?? CM, bM = B.mo ?? (A.mo ?? CM);
-        const aD = clamp(aY, aM, A.d), bD = clamp(bY, bM, B.d);
-        if (!(A.hadYear || B.hadYear) && aM < CM) {
-          const ask = `Zadal jste měsíc, který už proběhl. Prosím potvrďte, zda myslíte tento měsíc, nebo příští rok, případně napište přesný rok.`;
-          return { confirmed: null, ask };
-        }
-        const isoA = fmtISO(aY, aM, aD);
-        const isoB = fmtISO(bY, bM, bD); // den odjezdu
-        const from = isoA <= isoB ? isoA : isoB;
-        const to   = isoA <= isoB ? isoB : isoA;
-        return { confirmed: { from, to }, ask: null };
-      }
-
-      // 3) "20. až 24.8.2025"
-      if (list.length === 1) {
-        const B = list[0];
-        const left = clean.slice(0, B.idx);
-        const m2 = /(^|\D)(\d{1,2})\s*[. ]*(?=(?:až|az|to|–|-)\b)/i.exec(left);
-        if (m2) {
-          const d1 = +m2[2];
-          const y = B.y ?? CY, mo = B.mo ?? CM;
-          if (!B.hadYear && mo < CM) {
-            const ask = `Zadal jste měsíc, který už proběhl. Prosím potvrďte, zda myslíte tento měsíc, nebo příští rok, případně napište přesný rok.`;
-            return { confirmed: null, ask };
-          }
-          const from = fmtISO(y, mo, clamp(y, mo, Math.min(d1, B.d)));
-          const to   = fmtISO(y, mo, clamp(y, mo, Math.max(d1, B.d))); // den odjezdu
-          return { confirmed: { from, to }, ask: null };
-        }
-      }
-      return { confirmed: null, ask: null };
+      const d1 = +m[2], m1 = +m[3], d2 = +m[4], m2 = +m[5], y = +m[6];
+      const a = { y, mo: m1, d: clamp(y, m1, d1) };
+      const b = { y, mo: m2, d: clamp(y, m2, d2) };
+      const isoA = fmtISO(a.y, a.mo, a.d);
+      const isoB = fmtISO(b.y, b.mo, b.d);
+      const from = isoA <= isoB ? isoA : isoB;
+      const to   = isoA <= isoB ? isoB : isoA; // den odjezdu (exkluzivní pro smyčku)
+      return { confirmed: { from, to }, ask: null };
     }
 
-    // Vytažení posledního potvrzeného rozsahu z HISTORIE („Dostupnost pro **YYYY-MM-DD → YYYY-MM-DD**“)
+    // poslední potvrzený rozsah z odpovědi bota („Dostupnost pro **YYYY-MM-DD → YYYY-MM-DD**“)
     function rangeFromHistory(msgs) {
       for (let i = msgs.length - 1; i >= 0; i--) {
         const m = msgs[i];
@@ -139,67 +95,40 @@ export default async (req) => {
       return null;
     }
 
-    // Pomocné pro „tento měsíc / příští rok“
-    function findLastDatesInHistory(msgs) {
-      const re = /(\d{1,2})\s*[.\-\/]\s*(\d{1,2})(?:\s*[.\-\/]\s*(\d{2,4}))?/g;
-      for (let i = msgs.length - 1; i >= 0; i--) {
-        const m = msgs[i]; if (m.role !== 'user') continue;
-        re.lastIndex = 0;
-        const t = m.content || '';
-        const h1 = re.exec(t); if (!h1) continue;
-        const h2 = re.exec(t);
-        const d1 = Number(h1[1]), mo1 = Number(h1[2]), y1 = h1[3] ? Number(h1[3]) : null;
-        let d2 = d1, mo2 = mo1, y2 = y1;
-        if (h2) { d2 = Number(h2[1]); mo2 = Number(h2[2]); y2 = h2[3] ? Number(h2[3]) : y1; }
-        return { d1, mo1, y1, d2, mo2, y2 };
+    // ---------- EXTRAKCE DETAILŮ (jméno, SPZ, čas) ----------
+    function extractDetails(msgs) {
+      const t = ([...msgs].reverse().find(m => m.role === 'user')?.content || '').trim();
+      if (!t) return null;
+      const timeMatch = t.match(/(\b\d{1,2}[:.]\d{2}\b)/);
+      const arrival = timeMatch ? timeMatch[1].replace('.', ':') : null;
+      const parts = t.split(/[,;\n]/).map(s => s.trim()).filter(Boolean);
+
+      let plate = null;
+      for (const p of parts) {
+        const c = p.replace(/\s+/g,'');
+        if (/^[A-Za-z0-9-]{5,}$/.test(c)) { plate = c.toUpperCase(); break; }
       }
-      return null;
-    }
-    function detectChoice(text) {
-      const t = (text || '').toLowerCase().normalize('NFD').replace(/\p{Diacritic}/gu,'');
-      if (/tento\s+mesic/.test(t)) return 'this_month';
-      if (/pristi\s+rok/.test(t))  return 'next_year';
-      return null;
+      let name = null;
+      for (const p of parts) {
+        const clean = p.replace(/\s+/g,' ').trim();
+        if (arrival && clean.includes(arrival)) continue;
+        if (plate && clean.replace(/\s+/g,'').toUpperCase() === plate) continue;
+        if (clean.length >= 3) { name = clean; break; }
+      }
+      if (!name && !plate && !arrival) return null;
+      return { guest_name: name || '', car_plate: plate || '', arrival_time: arrival || '' };
     }
 
     const lastUserText = [...messages].reverse().find(m => m.role === 'user')?.content || '';
-    let parsed = parseDatesSmart(lastUserText);
+    let parsed = parseDatesStrict(lastUserText);
 
-    if (!parsed.confirmed) {
-      // 1) „tento měsíc / příští rok“
-      const choice = detectChoice(lastUserText);
-      if (choice) {
-        const last = findLastDatesInHistory(messages);
-        if (last) {
-          const now = new Date();
-          const CY = now.getFullYear();
-          const CM = now.getMonth() + 1;
-          let yA, yB, moA, moB, dA, dB;
-          if (choice === 'this_month') {
-            yA = CY; yB = CY; moA = CM; moB = CM; dA = last.d1; dB = last.d2;
-          } else {
-            yA = (last.y1 ?? CY) + 1; yB = (last.y2 ?? last.y1 ?? CY) + 1;
-            moA = last.mo1; moB = last.mo2; dA = last.d1; dB = last.d2;
-          }
-          const from = fmtISO(yA, moA, clamp(yA, moA, dA));
-          const to   = fmtISO(yB, moB, clamp(yB, moB, dB));
-          parsed = { confirmed: { from, to }, ask: null };
-        }
-      }
-      // 2) nic? → vezmi poslední potvrzený rozsah z historie
-      if (!parsed.confirmed) {
-        const r = rangeFromHistory(messages);
-        if (r) parsed = { confirmed: r, ask: null };
-      }
-    }
-
-    // ---------- Dostupnost (počítáme NOCI: for cur < end) ----------
+    // ---------- DOSTUPNOST (počítáme NOCI: for cur < to) ----------
     let AVAILABILITY = null;
     if (parsed.confirmed) {
       const { from, to } = parsed.confirmed;
       const out = [];
       const start = new Date(from + 'T00:00:00Z');
-      const end   = new Date(to   + 'T00:00:00Z'); // 'to' = den odjezdu, sem už bez +1
+      const end   = new Date(to   + 'T00:00:00Z'); // 'to' = den odjezdu
       for (let cur = new Date(start); cur < end; cur.setUTCDate(cur.getUTCDate() + 1)) {
         const iso = toISODate(cur);
         try {
@@ -237,32 +166,9 @@ ${allFree
       };
     }
 
-    // ---------- Extrakce detailů ----------
-    function extractDetails(msgs) {
-      const t = ([...msgs].reverse().find(m => m.role === 'user')?.content || '').trim();
-      if (!t) return null;
-      const timeMatch = t.match(/(\b\d{1,2}[:.]\d{2}\b)/);
-      const arrival = timeMatch ? timeMatch[1].replace('.', ':') : null;
-      const parts = t.split(/[,;\n]/).map(s => s.trim()).filter(Boolean);
-
-      let plate = null;
-      for (const p of parts) {
-        const c = p.replace(/\s+/g,'');
-        if (/^[A-Za-z0-9-]{5,}$/.test(c)) { plate = c.toUpperCase(); break; }
-      }
-      let name = null;
-      for (const p of parts) {
-        const clean = p.replace(/\s+/g,' ').trim();
-        if (arrival && clean.includes(arrival)) continue;
-        if (plate && clean.replace(/\s+/g,'').toUpperCase() === plate) continue;
-        if (clean.length >= 3) { name = clean; break; }
-      }
-      if (!name && !plate && !arrival) return null;
-      return { guest_name: name || '', car_plate: plate || '', arrival_time: arrival || '' };
-    }
     const details = extractDetails(messages);
 
-    // ---------- OpenAI helper (pro překlad) ----------
+    // ---------- Překladač (jen pro instrukce) ----------
     async function callOpenAI(msgs) {
       const r = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
@@ -300,12 +206,20 @@ Na dvoře/parkovišti je hlavní vchod.
     }
 
     // ---------- Rezervace ----------
+    // a) už máme dostupnost i detaily (jméno + SPZ) → rovnou zapiš
     if (AVAILABILITY && AVAILABILITY.allFree && AVAILABILITY.nights > 0 && details && details.guest_name && details.car_plate) {
+      // fallback: pokud uživatel neposlal znovu data, vezmeme poslední rozsah z historie
+      let from = AVAILABILITY.from, to = AVAILABILITY.to;
+      if (!from || !to) {
+        const hist = rangeFromHistory(messages);
+        if (hist) { from = hist.from; to = hist.to; }
+      }
+
       try {
         const payload = {
           fn: 'reserveParking',
-          from_date: AVAILABILITY.from,
-          to_date: AVAILABILITY.to,
+          from_date: from,
+          to_date: to,
           guest_name: details.guest_name,
           channel: 'Direct',
           car_plate: details.car_plate,
@@ -336,15 +250,18 @@ ${instr}${mediaBlock()}`;
       }
     }
 
-    // ---------- Výstup dostupnosti / dotaz ----------
+    // b) máme dostupnost, ale chybí detail(y) → vypiš dostupnost a vyžádej si je
     if (AVAILABILITY) {
       return new Response(JSON.stringify({ reply: AVAILABILITY.text }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
+
+    // c) nemáme platný formát → vypiš instrukci s požadovaným formátem
     if (!parsed.confirmed && parsed.ask) {
       return new Response(JSON.stringify({ reply: parsed.ask }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
 
-    return new Response(JSON.stringify({ reply: 'Jak vám mohu pomoci?' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    // fallback
+    return new Response(JSON.stringify({ reply: 'Pro rezervaci napište prosím datum ve formátu **DD.MM.–DD.MM.YYYY** (např. **20.09.–24.09.2025**).' }), { status: 200, headers: { 'content-type': 'application/json' } });
 
   } catch (err) {
     return new Response(`Function error: ${String(err)}`, { status: 500, headers: { 'content-type': 'text/plain' } });
