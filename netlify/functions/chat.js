@@ -1,12 +1,18 @@
 // netlify/functions/chat.js
-// Jednoduchý režim s pevným formátem dat: "DD.MM.–DD.MM.YYYY" (nebo s '-')
-// Př.: "20.09.–24.09.2025" → from=2025-09-20, to=2025-09-24 (den odjezdu se nepočítá)
-// NOVÉ: pokud další zpráva obsahuje jen jméno/SPZ/čas a předtím už padla dostupnost,
-//       vezme se POSLEDNÍ potvrzený rozsah z historie a rovnou se rezervuje.
+// Strictní formát dat: "DD.MM.–DD.MM.YYYY" (nebo '-')
+// Př.: "20.09.–24.09.2025" → from=2025-09-20, to=2025-09-24 (nocí: 4)
+// Verze s "měkkým pádem": NIKDY 500; vždy vrací JSON s chybou k zobrazení.
 
 const TRANSLATE_INSTRUCTIONS = true;
 
 export default async (req) => {
+  // helper na jednotné OK odpovědi
+  const ok = (reply) => new Response(JSON.stringify({ reply }), {
+    status: 200, headers: { 'content-type': 'application/json' }
+  });
+  // helper na uživatelskou chybovou zprávu
+  const userErr = (msg) => ok(`⚠️ ${msg}`);
+
   try {
     if (req.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
 
@@ -18,8 +24,8 @@ export default async (req) => {
     // ---------- ENV ----------
     const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
     const SHEETS_API_URL = process.env.SHEETS_API_URL;
-    if (!OPENAI_API_KEY) return new Response('Missing OPENAI_API_KEY', { status: 500 });
-    if (!SHEETS_API_URL) return new Response('Missing SHEETS_API_URL', { status: 500 });
+    if (!OPENAI_API_KEY) return userErr('Server: chybí OPENAI_API_KEY.');
+    if (!SHEETS_API_URL) return userErr('Server: chybí SHEETS_API_URL.');
 
     // ---------- PUBLIC data ----------
     const base = new URL(req.url);
@@ -33,32 +39,36 @@ export default async (req) => {
 
     // ---------- Apps Script ----------
     async function gsGet(params) {
-      const url = new URL(SHEETS_API_URL);
-      Object.entries(params || {}).forEach(([k, v]) => url.searchParams.set(k, v));
-      const r = await fetch(url.toString());
-      const txt = await r.text();
-      if (!r.ok) throw new Error(`Sheets GET ${r.status}: ${txt}`);
-      try { return JSON.parse(txt); } catch { return { ok:false, error:'bad json', raw: txt }; }
+      try {
+        const url = new URL(SHEETS_API_URL);
+        Object.entries(params || {}).forEach(([k, v]) => url.searchParams.set(k, v));
+        const r = await fetch(url.toString(), { redirect: 'follow' });
+        const txt = await r.text();
+        if (!r.ok) return { ok:false, error:`Sheets GET ${r.status}`, raw: txt };
+        try { return JSON.parse(txt); } catch { return { ok:false, error:'Bad JSON from Sheets GET', raw: txt }; }
+      } catch (e) { return { ok:false, error:String(e) }; }
     }
     async function gsPost(payload) {
-      const r = await fetch(SHEETS_API_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload || {})
-      });
-      const txt = await r.text();
-      if (!r.ok) throw new Error(`Sheets POST ${r.status}: ${txt}`);
-      try { return JSON.parse(txt); } catch { return { ok:false, error:'bad json from sheets', raw: txt }; }
+      try {
+        const r = await fetch(SHEETS_API_URL, {
+          method: 'POST',
+          redirect: 'follow',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload || {})
+        });
+        const txt = await r.text();
+        if (!r.ok) return { ok:false, error:`Sheets POST ${r.status}`, raw: txt };
+        try { return JSON.parse(txt); } catch { return { ok:false, error:'Bad JSON from Sheets POST', raw: txt }; }
+      } catch (e) { return { ok:false, error:String(e) }; }
     }
 
     // ---------- Date utils ----------
-    const toISODate   = (d) => d.toISOString().slice(0, 10);  // UTC yyyy-mm-dd
+    const toISODate   = (d) => d.toISOString().slice(0, 10);
     const daysInMonth = (y,m) => new Date(y, m, 0).getDate();
     const clamp       = (y,m,d) => Math.min(Math.max(1,d), daysInMonth(y,m));
     const fmtISO      = (y,m,d) => `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
 
     // ---------- STRIKTNÍ PARSER ----------
-    // Povolen jen formát: "DD.MM.–DD.MM.YYYY" nebo "DD.MM-DD.MM.YYYY"
     function parseDatesStrict(text) {
       const t = (text || '').trim();
       const re = /(^|.*?\s)\b(\d{2})\.(\d{2})\.\s*[–-]\s*(\d{2})\.(\d{2})\.(\d{4})\b/;
@@ -75,18 +85,15 @@ export default async (req) => {
       const isoA = fmtISO(a.y, a.mo, a.d);
       const isoB = fmtISO(b.y, b.mo, b.d);
       const from = isoA <= isoB ? isoA : isoB;
-      const to   = isoA <= isoB ? isoB : isoA; // den odjezdu (exkluzivní ve smyčce níž)
+      const to   = isoA <= isoB ? isoB : isoA; // den odjezdu (exkluzivní)
       return { confirmed: { from, to }, ask: null };
     }
 
-    // poslední potvrzený rozsah z odpovědi bota: „Dostupnost pro **YYYY-MM-DD → YYYY-MM-DD**“
+    // poslední potvrzený rozsah z historie: „Dostupnost pro **YYYY-MM-DD → YYYY-MM-DD**“
     function rangeFromHistory(msgs) {
       for (let i = msgs.length - 1; i >= 0; i--) {
-        const m = msgs[i];
-        if (!m || !m.content) continue;
-        const t = String(m.content);
-        const rx = /Dostupnost pro \*\*(\d{4}-\d{2}-\d{2})\s*→\s*(\d{4}-\d{2}-\d{2})\*\*/;
-        const mm = rx.exec(t);
+        const m = msgs[i]; if (!m || !m.content) continue;
+        const mm = /Dostupnost pro \*\*(\d{4}-\d{2}-\d{2})\s*→\s*(\d{4}-\d{2}-\d{2})\*\*/.exec(String(m.content));
         if (mm) return { from: mm[1], to: mm[2] };
       }
       return null;
@@ -123,9 +130,12 @@ export default async (req) => {
         headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: 'gpt-4o-mini', messages: msgs, temperature: 0.2 })
       });
-      if (!r.ok) throw new Error(`OpenAI ${r.status}: ${await r.text()}`);
-      const data = await r.json();
-      return data.choices?.[0]?.message?.content || '';
+      const txt = await r.text();
+      if (!r.ok) return `Translator error ${r.status}: ${txt}`;
+      try {
+        const data = JSON.parse(txt);
+        return data.choices?.[0]?.message?.content || '';
+      } catch { return `Translator bad json: ${txt}`; }
     }
     async function translateIfNeeded(text, userMsgs) {
       if (!TRANSLATE_INSTRUCTIONS) return text;
@@ -134,7 +144,8 @@ export default async (req) => {
         { role: 'system', content: 'You are a precise translator. Keep meaning and formatting. If source equals target language, return as is.' },
         { role: 'user', content: `User language sample:\n---\n${sample}\n---\nTranslate:\n${text}` }
       ];
-      return await callOpenAI(msgs);
+      const out = await callOpenAI(msgs);
+      return out || text;
     }
 
     // ---------- Instrukce + média ----------
@@ -153,49 +164,31 @@ Na dvoře/parkovišti je hlavní vchod.
       return `\n\n**Fotky / mapa / animace:**\n${lines.join('\n')}`;
     }
 
-    // ---------- ŘÍDÍCÍ LOGIKA ----------
+    // ---------- LOGIKA ----------
 
-    // 1) Zkusím vytáhnout datum z POSLEDNÍ uživatelské zprávy
     const lastUserText = [...messages].reverse().find(m => m.role === 'user')?.content || '';
     let parsed = parseDatesStrict(lastUserText);
 
-    // 2) Když datum v poslední zprávě není správného formátu,
-    //    ale už PŘEDTÍM bot vypsal dostupnost s rozsahem, tak si ten rozsah vezmu z historie.
-    let effectiveRange = null;
-    if (parsed.confirmed) {
-      effectiveRange = parsed.confirmed; // { from, to }
-    } else {
-      const hist = rangeFromHistory(messages);
-      if (hist) effectiveRange = hist; // umožní pokračovat po "David Eder, 4AD9111, 14:00"
-    }
+    // když datum není v poslední zprávě, zkusit vzít rozsah z historie
+    let effectiveRange = parsed.confirmed || rangeFromHistory(messages);
 
-    // 3) Načtu dostupnost pro effectiveRange (pokud ho mám)
+    // načíst dostupnost pro každou NOC (from..to-1)
     let AVAILABILITY = null;
     if (effectiveRange) {
       const { from, to } = effectiveRange;
       const out = [];
       const start = new Date(from + 'T00:00:00Z');
-      const end   = new Date(to   + 'T00:00:00Z'); // 'to' = den odjezdu (exkluzivně)
+      const end   = new Date(to   + 'T00:00:00Z'); // to = den odjezdu (exkluzivně)
       for (let cur = new Date(start); cur < end; cur.setUTCDate(cur.getUTCDate() + 1)) {
         const iso = toISODate(cur);
-        try {
-          const d = await gsGet({ fn: 'parking', date: iso });
-          if (!d || !d.ok || typeof d.total_spots === 'undefined') {
-            out.push({ date: iso, ok: false });
-          } else {
-            out.push({
-              date: iso, ok: true,
-              total: Number(d.total_spots) || 0,
-              booked: Number(d.booked) || 0,
-              free: Math.max(0, Number(d.free) || 0),
-              note: String(d.note || '')
-            });
-          }
-        } catch (e) { out.push({ date: iso, ok: false, error: String(e) }); }
+        const d = await gsGet({ fn: 'parking', date: iso });
+        if (!d || !d.ok || typeof d.total_spots === 'undefined') {
+          out.push({ date: iso, ok: false, free: 0, total: 0, note: d?.raw ? `Sheets raw: ${String(d.raw).slice(0,200)}` : '' });
+        } else {
+          out.push({ date: iso, ok: true, total: Number(d.total_spots)||0, booked: Number(d.booked)||0, free: Math.max(0, Number(d.free)||0), note: String(d.note||'') });
+        }
       }
-      const lines = out.map(d => d.ok
-        ? `• ${d.date}: volno ${d.free} / ${d.total}${d.note ? ` (${d.note})` : ''}`
-        : `• ${d.date}: dostupnost neznámá`);
+      const lines = out.map(d => d.ok ? `• ${d.date}: volno ${d.free} / ${d.total}${d.note ? ` (${d.note})` : ''}` : `• ${d.date}: dostupnost neznámá`);
       const allKnown = out.every(d => d.ok);
       const allFree  = allKnown && out.every(d => d.free > 0);
       const anyFull  = out.some(d => d.ok && d.free <= 0);
@@ -213,58 +206,51 @@ ${allFree
       };
     }
 
-    // 4) Pokus o rezervaci, pokud: máme dostupnost se všemi volnými nocemi + detaily od hosta
+    // extrahovat detaily (jméno/SPZ/čas)
     const details = extractDetails(messages);
-    if (AVAILABILITY && AVAILABILITY.allFree && AVAILABILITY.nights > 0 && details && details.guest_name && details.car_plate) {
-      try {
-        const payload = {
-          fn: 'reserveParking',
-          from_date: AVAILABILITY.from,
-          to_date: AVAILABILITY.to,
-          guest_name: details.guest_name,
-          channel: 'Direct',
-          car_plate: details.car_plate,
-          arrival_time: details.arrival_time || '',
-          note: ''
-        };
-        const result = await gsPost(payload);
 
-        if (result && result.ok && result.id) {
-          const instr = await translateIfNeeded(parkingInstructionsCZ, messages);
-          const reply =
+    // pokus o rezervaci, pokud máme všechno
+    if (AVAILABILITY && AVAILABILITY.allFree && AVAILABILITY.nights > 0 && details && details.guest_name && details.car_plate) {
+      const payload = {
+        fn: 'reserveParking',
+        from_date: AVAILABILITY.from,
+        to_date: AVAILABILITY.to,
+        guest_name: details.guest_name,
+        channel: 'Direct',
+        car_plate: details.car_plate,
+        arrival_time: details.arrival_time || '',
+        note: ''
+      };
+      const result = await gsPost(payload);
+
+      if (result && result.ok && result.id) {
+        const instr = await translateIfNeeded(parkingInstructionsCZ, messages);
+        const reply =
 `✅ Rezervace zapsána. ID: ${result.id}. Cena je 20 € / noc.
 Termín: ${payload.from_date} → ${payload.to_date}
 Host: ${payload.guest_name}, SPZ: ${payload.car_plate}, příjezd: ${payload.arrival_time || 'neuvedeno'}
 
 ${instr}${mediaBlock()}`;
-          return new Response(JSON.stringify({ reply }), { status: 200, headers: { 'content-type': 'application/json' } });
-        }
-
-        const err = (result && (result.error || result.raw)) ? String(result.error || result.raw) : 'Unknown error';
-        const human =
-          /fully booked on/i.test(err)
-            ? `Bohužel jeden z dnů je už plně obsazený (${err.replace(/^.*on\s+/i,'')}). Zkusíme jiný termín?`
-            : `Nepodařilo se zapsat rezervaci (${err}). Zkontrolujme ještě jednou údaje, případně to zkusím znovu.`;
-        return new Response(JSON.stringify({ reply: human }), { status: 200, headers: { 'content-type': 'application/json' } });
-      } catch (e) {
-        return new Response(JSON.stringify({ reply: `Nepodařilo se zapsat rezervaci (${String(e)}). Zkusíme to znovu, nebo vybereme jiný termín?` }), { status: 200, headers: { 'content-type': 'application/json' } });
+        return ok(reply);
+      } else {
+        const err = result?.error || 'Neznámá chyba';
+        const raw = result?.raw ? `\nRaw: ${String(result.raw).slice(0,500)}` : '';
+        return userErr(`Nepodařilo se zapsat rezervaci: ${err}.${raw}\n\nZkontrolujme SHEETS_API_URL (musí být "script.googleusercontent.com/.../exec" – tj. cílová adresa po přesměrování).`);
       }
     }
 
-    // 5) Pokud máme dostupnost, ale chybí nějaké údaje → vypiš dostupnost / požádej o údaje
-    if (AVAILABILITY) {
-      return new Response(JSON.stringify({ reply: AVAILABILITY.text }), { status: 200, headers: { 'content-type': 'application/json' } });
-    }
+    // pokud máme dostupnost, ale ne detaily → vypiš dostupnost
+    if (AVAILABILITY) return ok(AVAILABILITY.text);
 
-    // 6) Pokud nemáme rozsah ani z parseru ani z historie → ukaž instrukci na formát
-    if (!parsed.confirmed && parsed.ask) {
-      return new Response(JSON.stringify({ reply: parsed.ask }), { status: 200, headers: { 'content-type': 'application/json' } });
-    }
+    // pokud nemáme nic → ukaž formát dat
+    if (!parsed.confirmed && parsed.ask) return ok(parsed.ask);
 
-    // fallback
-    return new Response(JSON.stringify({ reply: 'Pro rezervaci napište prosím datum ve formátu **DD.MM.–DD.MM.YYYY** (např. **20.09.–24.09.2025**).' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    return ok('Pro rezervaci napište prosím datum ve formátu **DD.MM.–DD.MM.YYYY** (např. **20.09.–24.09.2025**).');
 
   } catch (err) {
-    return new Response(`Function error: ${String(err)}`, { status: 500, headers: { 'content-type': 'text/plain' } });
+    // měkký pád — vrátíme chybovou zprávu, ale 200
+    return new Response(JSON.stringify({ reply: `⚠️ Server error: ${String(err)}` }), {
+      status: 200, headers: { 'content-type': 'application/json' }
+    });
   }
 };
