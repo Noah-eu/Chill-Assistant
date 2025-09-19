@@ -1,47 +1,44 @@
 // netlify/functions/parking.ts
-// Jednoduchý parser => pouze vrací from/to (nocí = departure - arrival)
+// Jednoduchý proxy endpoint: /api/parking?q=YYYY-MM-DD
+// volá Apps Script: ?fn=parking&date=YYYY-MM-DD
 
-const fmtISO = (y:number,m:number,d:number) =>
-  `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
-const dim = (y:number,m:number) => new Date(y, m, 0).getDate();
-const clamp = (y:number,m:number,d:number) => Math.min(d, dim(y,m));
-
-function parseStrictRange(q: string) {
-  // Očekáváme přesně: DD.MM.–DD.MM.YYYY nebo DD.MM.-DD.MM.YYYY
-  // Skupiny: d1 m1 d2 m2 y
-  const re = /^\s*(\d{1,2})\.(\d{1,2})\.\s*[–-]\s*(\d{1,2})\.(\d{1,2})\.(\d{4})\s*$/;
-  const m = q.match(re);
-  if (!m) return { confirmed: null, ask: 'Použijte formát DD.MM.–DD.MM.YYYY (např. 20.09.–24.09.2025).' };
-
-  const d1 = Number(m[1]), m1 = Number(m[2]), d2 = Number(m[3]), m2 = Number(m[4]), y = Number(m[5]);
-
-  const a = { y, mo: m1, d: clamp(y, m1, Math.min(d1, d2)) };
-  const b = { y, mo: m2, d: clamp(y, m2, Math.max(d1, d2)) };
-
-  const isoA = fmtISO(a.y, a.mo, a.d);
-  const isoB = fmtISO(b.y, b.mo, b.d);
-  const from = isoA <= isoB ? isoA : isoB;
-  const to   = isoA <= isoB ? isoB : isoA;
-
-  return { confirmed: { from, to }, ask: null };
-}
+export const config = { path: '/api/parking' };
 
 export default async (req: Request) => {
   try {
-    const url = new URL(req.url);
-    const q = url.searchParams.get('q') || '';
-    const parsed = parseStrictRange(q);
+    const SHEETS_API_URL = process.env.SHEETS_API_URL;
+    if (!SHEETS_API_URL) {
+      return new Response(JSON.stringify({ ok: false, error: 'Missing SHEETS_API_URL' }), {
+        status: 500,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
 
-    return new Response(JSON.stringify({ ok: true, parsed }), {
-      status: 200,
-      headers: { 'content-type': 'application/json' }
+    const url = new URL(req.url);
+    const q = (url.searchParams.get('q') || '').trim(); // očekáváme YYYY-MM-DD
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(q)) {
+      return new Response(JSON.stringify({ ok: false, error: 'Bad or missing q=YYYY-MM-DD' }), {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
+    // zavoláme Apps Script (POZOR: SHEETS_API_URL MUSÍ být googleusercontent.com/…/echo)
+    const gs = new URL(SHEETS_API_URL);
+    gs.searchParams.set('fn', 'parking');
+    gs.searchParams.set('date', q);
+
+    const r = await fetch(gs.toString(), { method: 'GET' });
+    const txt = await r.text();
+    // Apps Script vrací JSON string — vrátíme ho dál jak přišel
+    return new Response(txt, {
+      status: r.ok ? 200 : r.status,
+      headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
     });
-  } catch (e:any) {
-    return new Response(JSON.stringify({ ok:false, error: String(e) }), {
+  } catch (e) {
+    return new Response(JSON.stringify({ ok: false, error: String(e) }), {
       status: 500,
-      headers: { 'content-type': 'application/json' }
+      headers: { 'content-type': 'application/json' },
     });
   }
 };
-
-export const config = { path: '/api/parking' };
