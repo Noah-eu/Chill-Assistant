@@ -10,7 +10,7 @@ export type ParkingStatus = {
   error?: string;
 };
 
-const BASE_URL = 'https://script.google.com/macros/s/XXXX/exec'; // ← sem dej tvůj webapp URL
+const BASE_URL = https://script.google.com/macros/s/AKfycbwT-0NYJtJFGzHnZJwQv1psvOKS9qfKrx_qBPy3DgJlO7A-gIDvmUC1cujVDzdxq2pzRw/exec; // ← sem dej tvůj webapp URL
 const WRITE_API_KEY = ''; // pokud jsi nastavil v code.gs, vyplň i tady
 
 function assertOk(res: Response) {
