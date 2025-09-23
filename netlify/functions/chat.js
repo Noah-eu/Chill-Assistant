@@ -1,7 +1,7 @@
 // netlify/functions/chat.js
 // Striktní formát dat: "DD.MM.–DD.MM.YYYY" (nebo '-').
 // Př.: "20.09.–24.09.2025" → from=2025-09-20, to=2025-09-24 (nocí: 4).
-// Měkký pád: nikdy 500; vždy vrací 200 s JSON { reply } vhodným k zobrazení.
+// „Měkký pád“: nikdy 500; vždy vrací 200 s JSON { reply } k zobrazení.
 
 const TRANSLATE_INSTRUCTIONS = true;
 
@@ -28,19 +28,15 @@ export default async (req) => {
 
     // ---------- ENV ----------
     const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-    const PARKING_API_URL = process.env.PARKING_API_URL; // NOVĚ
+    const PARKING_API_URL = process.env.PARKING_API_URL;   // Apps Script /exec
     const PARKING_WRITE_KEY = process.env.PARKING_WRITE_KEY || ""; // volitelné
 
-    if (!OPENAI_API_KEY && TRANSLATE_INSTRUCTIONS) {
-      // překlad vypneme, ale neblokujeme
-      console.warn("Missing OPENAI_API_KEY — translations disabled.");
-    }
     if (!PARKING_API_URL)
       return userErr(
-        'Server: chybí PARKING_API_URL. Nastav v Netlify "Environment variables" na URL Apps Script webapp (…/exec).'
+        'Server: chybí PARKING_API_URL. Nastav v Netlify (Production) na URL Apps Script WebApp (končící na /exec).'
       );
 
-    // ---------- PUBLIC data ----------
+    // ---------- Public data (statické JSON z /data) ----------
     const base = new URL(req.url);
     async function loadJSON(path) {
       try {
@@ -72,13 +68,19 @@ export default async (req) => {
           redirect: "follow",
         });
         const txt = await r.text();
-        if (!r.ok) return { ok: false, error: `GET ${r.status}`, raw: txt };
+
+        if (!r.ok) {
+          console.error("gsGetParking error", r.status, txt?.slice(0, 300));
+          return { ok: false, error: `GET ${r.status}`, raw: txt?.slice(0, 300) };
+        }
         try {
           return JSON.parse(txt);
         } catch {
-          return { ok: false, error: "Bad JSON from GET", raw: txt };
+          console.error("gsGetParking bad json", txt?.slice(0, 300));
+          return { ok: false, error: "Bad JSON from GET", raw: txt?.slice(0, 300) };
         }
       } catch (e) {
+        console.error("gsGetParking exception", e);
         return { ok: false, error: String(e) };
       }
     }
@@ -99,19 +101,24 @@ export default async (req) => {
           }),
         });
         const txt = await r.text();
-        if (!r.ok) return { ok: false, error: `POST ${r.status}`, raw: txt };
+        if (!r.ok) {
+          console.error("gsPostBook error", r.status, txt?.slice(0, 300));
+          return { ok: false, error: `POST ${r.status}`, raw: txt?.slice(0, 300) };
+        }
         try {
           return JSON.parse(txt);
         } catch {
-          return { ok: false, error: "Bad JSON from POST", raw: txt };
+          console.error("gsPostBook bad json", txt?.slice(0, 300));
+          return { ok: false, error: "Bad JSON from POST", raw: txt?.slice(0, 300) };
         }
       } catch (e) {
+        console.error("gsPostBook exception", e);
         return { ok: false, error: String(e) };
       }
     }
 
     async function gsPostCancel(dateISO, who) {
-      // POST { action:'cancel', date, who, apiKey? } — pro rollback
+      // POST { action:'cancel', date, who, apiKey? } – rollback
       try {
         const r = await fetch(PARKING_API_URL, {
           method: "POST",
@@ -125,13 +132,18 @@ export default async (req) => {
           }),
         });
         const txt = await r.text();
-        if (!r.ok) return { ok: false, error: `POST ${r.status}`, raw: txt };
+        if (!r.ok) {
+          console.error("gsPostCancel error", r.status, txt?.slice(0, 300));
+          return { ok: false, error: `POST ${r.status}`, raw: txt?.slice(0, 300) };
+        }
         try {
           return JSON.parse(txt);
         } catch {
-          return { ok: false, error: "Bad JSON from POST", raw: txt };
+          console.error("gsPostCancel bad json", txt?.slice(0, 300));
+          return { ok: false, error: "Bad JSON from POST", raw: txt?.slice(0, 300) };
         }
       } catch (e) {
+        console.error("gsPostCancel exception", e);
         return { ok: false, error: String(e) };
       }
     }
@@ -166,7 +178,7 @@ export default async (req) => {
       const isoA = fmtISO(a.y, a.mo, a.d);
       const isoB = fmtISO(b.y, b.mo, b.d);
       const from = isoA <= isoB ? isoA : isoB;
-      const to = isoA <= isoB ? isoB : isoA; // den odjezdu (exkluzivní)
+      const to = isoA <= isoB ? isoB : isoA; // den odjezdu (exkluzivně)
       return { confirmed: { from, to }, ask: null };
     }
 
@@ -223,12 +235,14 @@ export default async (req) => {
 
     // ---------- Překladač (jen pro instrukce) ----------
     async function callOpenAI(msgs) {
-      const key = OPENAI_API_KEY;
-      if (!key) return msgs.find((m) => m.role === "user")?.content || "";
+      if (!OPENAI_API_KEY) {
+        // Bez klíče překlad přeskočíme — vrátíme originál
+        return msgs.find((m) => m.role === "user")?.content || "";
+      }
       const r = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${key}`,
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
@@ -307,7 +321,7 @@ Na dvoře/parkovišti je hlavní vchod.
             ok: false,
             free: 0,
             total: 0,
-            note: d?.raw ? `raw: ${String(d.raw).slice(0, 200)}` : "",
+            note: d?.error ? `err: ${d.error}` : (d?.raw ? `raw: ${String(d.raw).slice(0,200)}` : ""),
           });
         } else {
           out.push({
@@ -323,7 +337,7 @@ Na dvoře/parkovišti je hlavní vchod.
       const lines = out.map((d) =>
         d.ok
           ? `• ${d.date}: volno ${d.free} / ${d.total}${d.note ? ` (${d.note})` : ""}`
-          : `• ${d.date}: dostupnost neznámá`
+          : `• ${d.date}: dostupnost neznámá${d.note ? ` (${d.note})` : ""}`
       );
       const allKnown = out.every((d) => d.ok);
       const allFree = allKnown && out.every((d) => d.free > 0);
@@ -364,7 +378,7 @@ Na dvoře/parkovišti je hlavní vchod.
       const bookedDates = [];
       let failed = null;
 
-      // 1) bezpečnostní kontrola – ještě jednou načíst volno pro každý den (race condition)
+      // 1) ještě jednou ověřit volno pro každý den (race condition)
       for (const d of AVAILABILITY.days) {
         const check = await gsGetParking(d.date);
         if (!check?.ok || (Number(check.free) || 0) <= 0) {
