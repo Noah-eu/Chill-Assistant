@@ -34,3 +34,15 @@ body{margin:0;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
 .bubble img{max-width:100%;height:auto;border-radius:.75rem;margin:.4rem 0;display:block}
 .bubble ol,.bubble ul{margin:.4rem 0 .4rem 1.2rem}
 .bubble a{word-break:break-all}
+
+/* --- Markdown/HTML „prose“ styl pro obsah asistenta --- */
+.prose{line-height:1.55}
+.prose p{margin:.4rem 0}
+.prose strong{font-weight:600}
+.prose em{font-style:italic}
+.prose ul,.prose ol{margin:.4rem 0 .4rem 1.2rem}
+.prose li{margin:.2rem 0}
+.prose a{color:#0b57d0;text-decoration:underline}
+.prose img{max-width:100%;height:auto;border-radius:.75rem;margin:.5rem 0;display:block}
+.prose figure{margin:.5rem 0}
+.prose figcaption{font-size:.8rem;opacity:.75;margin-top:.2rem}

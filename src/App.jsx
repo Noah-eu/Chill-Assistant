@@ -1,4 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react'
+import { marked } from 'marked'
+import DOMPurify from 'dompurify'
 
 export default function App(){
   const [chat, setChat] = useState([
@@ -8,7 +10,8 @@ export default function App(){
   const [loading, setLoading] = useState(false)
   const scrollerRef = useRef(null)
 
-  useEffect(() => { scrollerRef.current?.scrollTo(0, 9999999) }, [chat])
+  // scroll na konec po každé změně chatu
+  useEffect(() => { scrollerRef.current?.scrollTo(0, 9_999_999) }, [chat])
 
   async function send(){
     if(!input.trim()) return
@@ -34,6 +37,15 @@ export default function App(){
     }
   }
 
+  // převod Markdown → bezpečné HTML
+  function renderAssistant(md = ''){
+    // povol řádkové zlomy jako <br>, lepší čtení
+    const rawHtml = marked.parse(md, { breaks: true })
+    // očistit XSS
+    const safeHtml = DOMPurify.sanitize(rawHtml)
+    return { __html: safeHtml }
+  }
+
   return (
     <div className="min-h-screen p-4 flex flex-col items-center bg-zinc-100">
       <div className="w-full max-w-2xl bg-white rounded-2xl shadow p-4">
@@ -45,7 +57,7 @@ export default function App(){
         <div ref={scrollerRef} className="chatbox">
           {chat.map((m, i) => (
             m.role === 'assistant'
-              ? <div key={i} className="bubble a" dangerouslySetInnerHTML={{ __html: m.content }} />
+              ? <div key={i} className="bubble a prose" dangerouslySetInnerHTML={renderAssistant(m.content)} />
               : <div key={i} className="bubble u">{m.content}</div>
           ))}
           {loading && <div className="bubble a">…</div>}
