@@ -283,8 +283,71 @@ export default async (req) => {
 
     // ---------- Instrukce + média ----------
     const parkingInstructionsCZ = `
-Parkoviště je na našem dvoře v ceně 20 eur (500 Kč) za noc. Odkud přijíždíte? Pokud od jihu, tak až zabočíte na naší ulici, zařaďte se do pravého pruhu a tam pak vyčkejte až bude silnice prázdná. Z něj pak kolmo rovnou do našeho průjezdu na dvůr. Ten průjezd je totiž dost úzký (šířka 220 cm) a z krajního pruhu se do něj nedá vjet. Pokud přijíždíte z druhé strany, objeďte radši ještě náš blok. Bude totiž za vámi velký provoz a nebude možnost zajet do průjezdu z protějšího pruhu. Pokud blok objedete, nepojede za vámi skoro nikdo.
-Na dvoře/parkovišti je hlavní vchod.
+**Parkování a příjezd**
+- Rezervované parkování je k dispozici od **12:00** v den příjezdu.
+- V den odjezdu je **check-out z pokoje do 11:00**. Ponechání auta po 11:00 je možné **jen dle dostupnosti** – napište, potvrdíme.
+- Průjezd do dvora je **úzký (šířka 220 cm)**, ale **výška je neomezená** – projede i vysoké auto.
+- Když je parkoviště plné a potřebujete jen vyložit věci: na **chodníku před domem** (mezi naším a vedlejším vjezdem) lze zastavit cca **10 minut**. (Viz foto níže.)
+
+**Self check-in / klíče**
+- Kód do boxu a **číslo apartmánu pošle David** před příjezdem.
+- V bagážovně jsou **náhradní klíče** podle čísla apartmánu:
+  001→3301, 101→3302, 102→3303, 103→3304, 104→3305, 105→3306,
+  201→3307, 202→3308, 203→3309, 204→3310, 205→3311,
+  301→3312, 302→3313, 303→3314, 304→3315, 305→3316.
+  Po použití prosíme **číselník zamíchat** a klíč **vrátit na místo**.
+
+**Úschovna zavazadel**
+- **Příjezd před 11:00**: uložte věci v **bagážovně**.
+- **Po check-outu (po 11:00)**: můžete uložit věci v bagážovně, nebo je ponechat v apartmánu a **vrátit se později**. Pokud uvidíte, že je už **uklizeno**, můžete **zůstat**.
+
+**Bezbariérovost / schody**
+- Do budovy jsou **2 schody**, do apartmánu **001** v přízemí je **1 schod**. Jinak bez schodů a s **velkým výtahem**.
+- Sprchové kouty mají **cca 30 cm** práh vaničky.
+
+**Číslování a balkony**
+- První číslo apartmánu = **patro** (001 přízemí, 101 1. patro, …).
+- **Balkony** mají: **105, 205, 305**. Ostatní mohou využít **společné balkony** u výtahu na každém patře.
+
+**Elektřina – jističe**
+- Nejprve zkontrolujte **jističe v apartmánu** (malá bílá dvířka ve zdi).
+- Pokud je problém dál, u balkonu jsou **hlavní troj-jističe**; spadlý bude jako **jediný dole**.
+
+**AC (klimatizace)**
+- Režim **Sun = topení**, **Snowflake = chlazení**.
+- Pokud **bliká zelená** na AC, je potřeba **restart**: na **balkonu 2. patra** jsou vypínače AC – **vypnout ~30 s, pak zapnout**.
+
+**Wi-Fi (SSID / heslo)**
+001→ D384 / 07045318  
+101→ CDEA / 51725587  
+102→ CF2A / 09341791  
+103→ 93EO / 25133820  
+104→ D93A / 10661734  
+105→ D9E4 / 09464681  
+201→ 6A04 / 44791957  
+202→ 9B7A / 65302361  
+203→ 1CF8 / 31284547  
+204→ D8C4 / 73146230  
+205→ CD9E / 02420004  
+301→ CF20 / 96995242  
+302→ 23F0 / 46893345  
+303→ B4B4 / 07932908  
+304→ DA4E / 03274644  
+305→ D5F6 / 45445804
+
+Pokud Wi-Fi nefunguje: zkontrolujte kabely a zkuste **restart** (vytáhnout napájení na 10 s, pak zapnout). Když to nepomůže, napište, **jakou síť vidíte**, pošleme správné heslo.
+
+**Zvířata**
+- **Psi jsou vítáni a zdarma**, jen prosíme **ne na postele/gauče**.
+
+**Taxi (letiště)**
+- Pro objednání potřebujeme: **číslo letu**, **čas příletu**, **telefon**, **počet osob a kufrů**, a zda **stačí sedan** nebo je potřeba **větší vůz**.  
+- Na cestu **z hotelu na letiště** stačí čas vyzvednutí u hotelu.  
+- **Ráno 8–9** a **15–17** mohou být **zácpy** (počítejte až **60 min**).  
+- **Dětské sedačky** máme – napište **věk dítěte**.  
+- Potvrzení:  
+  *“I arranged the pick-up for you. The driver will be waiting in the arrival hall with your name on a sign. In case you can’t find each other, please call +420 722 705 919. The price is 31 EUR / 750 CZK (cash or card to the driver).”*  
+  (Pro 5–8 osob nebo hodně zavazadel: **42 EUR / 1000 CZK**.)
 `.trim();
 
     function mediaBlock() {
@@ -374,7 +437,7 @@ Na dvoře/parkovišti je hlavní vchod.
       details.guest_name &&
       details.car_plate
     ) {
-      const who = `${details.guest_name} / ${details.car_plate}`.trim();
+      const who = `${details.guest_name} / ${details.car_plate}`.trim(); // ukládáme jako "Jméno / SPZ"
       const bookedDates = [];
       let failed = null;
 
@@ -407,14 +470,15 @@ Na dvoře/parkovišti je hlavní vchod.
       }
 
       if (!failed) {
-        const instr = await translateIfNeeded(parkingInstructionsCZ, messages);
         const list = AVAILABILITY.days.map((d) => `• ${d.date}`).join("\n");
+        const instr = await translateIfNeeded(parkingInstructionsCZ, messages);
+
         const reply =
-          `✅ Rezervace zapsána (${AVAILABILITY.nights} nocí):\n${list}\n` +
-          `Host: ${details.guest_name}, SPZ: ${details.car_plate}, příjezd: ${
-            details.arrival_time || "neuvedeno"
-          }\n\n` +
-          `${instr}${mediaBlock()}`;
+`✅ Rezervace zapsána (${AVAILABILITY.nights} nocí):
+${list}
+Host: ${details.guest_name}, SPZ: ${details.car_plate}, příjezd: ${details.arrival_time || "neuvedeno"}
+
+${instr}${mediaBlock()}`;
         return ok(reply);
       } else {
         const why =
