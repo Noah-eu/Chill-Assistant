@@ -148,14 +148,13 @@ export default async (req) => {
       }
     }
 
-    // ---------- Date utils ----------
+    // ---------- Utils ----------
     const toISODate = (d) => d.toISOString().slice(0, 10);
     const daysInMonth = (y, m) => new Date(y, m, 0).getDate();
     const clamp = (y, m, d) => Math.min(Math.max(1, d), daysInMonth(y, m));
     const fmtISO = (y, m, d) =>
       `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
 
-    // ---------- STRIKTNÍ PARSER ----------
     function parseDatesStrict(text) {
       const t = (text || "").trim();
       const re =
@@ -195,128 +194,27 @@ export default async (req) => {
       return null;
     }
 
-    // ---------- EXTRAKCE DETAILŮ (jméno, SPZ, čas) ----------
-    function extractDetails(msgs) {
-      const t =
-        ([...msgs].reverse().find((m) => m.role === "user")?.content || "").trim();
-      if (!t) return null;
-      const timeMatch = t.match(/(\b\d{1,2}[:.]\d{2}\b)/);
-      const arrival = timeMatch ? timeMatch[1].replace(".", ":") : null;
-      const parts = t
-        .split(/[,;\n]/)
-        .map((s) => s.trim())
-        .filter(Boolean);
-
-      let plate = null;
-      for (const p of parts) {
-        const c = p.replace(/\s+/g, "");
-        if (/^[A-Za-z0-9-]{5,}$/.test(c)) {
-          plate = c.toUpperCase();
-          break;
-        }
-      }
-      let name = null;
-      for (const p of parts) {
-        const clean = p.replace(/\s+/g, " ").trim();
-        if (arrival && clean.includes(arrival)) continue;
-        if (plate && clean.replace(/\s+/g, "").toUpperCase() === plate) continue;
-        if (clean.length >= 3) {
-          name = clean;
-          break;
-        }
-      }
-      if (!name && !plate && !arrival) return null;
-      return {
-        guest_name: name || "",
-        car_plate: plate || "",
-        arrival_time: arrival || "",
-      };
+    // ---------- Intenty (router) ----------
+    function detectIntent(text) {
+      const t = (text || "").toLowerCase();
+      const hasDate = /(\d{2})\.(\d{2})\.\s*[–-]\s*(\d{2})\.(\d{2})\.(\d{4})/.test(t);
+      const parkingKW = /(park|parking|parkování|auto|spz|car|garage|garáž)/i.test(text);
+      if (hasDate || parkingKW) return "parking";
+      if (/(wifi|wi-?fi|internet)/i.test(t)) return "wifi";
+      if (/(taxi|airport|letiště|pick ?up|transfer)/i.test(t)) return "taxi";
+      if (/(schod|stairs|handicap|wheelchair|invalid)/i.test(t)) return "stairs";
+      if (/\bac\b|klima|air ?con|airconditioning|air-conditioning/i.test(t)) return "ac";
+      if (/(elektr|jistič|fuse|breaker|power|electric)/i.test(t)) return "power";
+      if (/(zavazad|bag|luggage|storage|úschov)/i.test(t)) return "luggage";
+      if (/(balkon|balcony)/i.test(t)) return "balcony";
+      if (/(pes|dog|pet|zvíř|animals)/i.test(t)) return "pets";
+      if (/(check[- ]?in|check[- ]?out|arrival|příjezd|odjezd|welcome|instructions?)/i.test(t)) return "checkin";
+      return "unknown";
     }
 
-    // ---------- Překladač (jen pro instrukce) ----------
-    async function callOpenAI(msgs) {
-      if (!OPENAI_API_KEY) {
-        // Bez klíče překlad přeskočíme — vrátíme originál
-        return msgs.find((m) => m.role === "user")?.content || "";
-      }
-      const r = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "gpt-4o-mini",
-          messages: msgs,
-          temperature: 0.2,
-        }),
-      });
-      const txt = await r.text();
-      if (!r.ok) return `Translator error ${r.status}: ${txt}`;
-      try {
-        const data = JSON.parse(txt);
-        return data.choices?.[0]?.message?.content || "";
-      } catch {
-        return `Translator bad json: ${txt}`;
-      }
-    }
-
-    async function translateIfNeeded(text, userMsgs) {
-      if (!TRANSLATE_INSTRUCTIONS) return text;
-      const sample =
-        ([...userMsgs].reverse().find((m) => m.role === "user")?.content ||
-          "").slice(0, 500);
-      const msgs = [
-        {
-          role: "system",
-          content:
-            "You are a precise translator. Keep meaning and formatting. If source equals target language, return as is.",
-        },
-        {
-          role: "user",
-          content: `User language sample:\n---\n${sample}\n---\nTranslate:\n${text}`,
-        },
-      ];
-      const out = await callOpenAI(msgs);
-      return out || text;
-    }
-
-    // ---------- Instrukce + média ----------
-    const parkingInstructionsCZ = `
-**Parkování a příjezd**
-- Rezervované parkování je k dispozici od **12:00** v den příjezdu.
-- V den odjezdu je **check-out z pokoje do 11:00**. Ponechání auta po 11:00 je možné **jen dle dostupnosti** – napište, potvrdíme.
-- Průjezd do dvora je **úzký (šířka 220 cm)**, ale **výška je neomezená** – projede i vysoké auto.
-- Když je parkoviště plné a potřebujete jen vyložit věci: na **chodníku před domem** (mezi naším a vedlejším vjezdem) lze zastavit cca **10 minut**. (Viz foto níže.)
-
-**Self check-in / klíče**
-- Kód do boxu a **číslo apartmánu pošle David** před příjezdem.
-- V bagážovně jsou **náhradní klíče** podle čísla apartmánu:
-  001→3301, 101→3302, 102→3303, 103→3304, 104→3305, 105→3306,
-  201→3307, 202→3308, 203→3309, 204→3310, 205→3311,
-  301→3312, 302→3313, 303→3314, 304→3315, 305→3316.
-  Po použití prosíme **číselník zamíchat** a klíč **vrátit na místo**.
-
-**Úschovna zavazadel**
-- **Příjezd před 11:00**: uložte věci v **bagážovně**.
-- **Po check-outu (po 11:00)**: můžete uložit věci v bagážovně, nebo je ponechat v apartmánu a **vrátit se později**. Pokud uvidíte, že je už **uklizeno**, můžete **zůstat**.
-
-**Bezbariérovost / schody**
-- Do budovy jsou **2 schody**, do apartmánu **001** v přízemí je **1 schod**. Jinak bez schodů a s **velkým výtahem**.
-- Sprchové kouty mají **cca 30 cm** práh vaničky.
-
-**Číslování a balkony**
-- První číslo apartmánu = **patro** (001 přízemí, 101 1. patro, …).
-- **Balkony** mají: **105, 205, 305**. Ostatní mohou využít **společné balkony** u výtahu na každém patře.
-
-**Elektřina – jističe**
-- Nejprve zkontrolujte **jističe v apartmánu** (malá bílá dvířka ve zdi).
-- Pokud je problém dál, u balkonu jsou **hlavní troj-jističe**; spadlý bude jako **jediný dole**.
-
-**AC (klimatizace)**
-- Režim **Sun = topení**, **Snowflake = chlazení**.
-- Pokud **bliká zelená** na AC, je potřeba **restart**: na **balkonu 2. patra** jsou vypínače AC – **vypnout ~30 s, pak zapnout**.
-
+    // ---------- Sekce (CZ) pro ne-parkovací odpovědi ----------
+    const SECTIONS_CZ = {
+      wifi: `
 **Wi-Fi (SSID / heslo)**
 001→ D384 / 07045318  
 101→ CDEA / 51725587  
@@ -336,20 +234,60 @@ export default async (req) => {
 305→ D5F6 / 45445804
 
 Pokud Wi-Fi nefunguje: zkontrolujte kabely a zkuste **restart** (vytáhnout napájení na 10 s, pak zapnout). Když to nepomůže, napište, **jakou síť vidíte**, pošleme správné heslo.
+`.trim(),
+      taxi: `
+**Taxi (letiště)**
+Pro objednání potřebujeme: **číslo letu**, **čas příletu**, **telefon**, **počet osob a kufrů**, a zda **stačí sedan** nebo je potřeba **větší vůz**.
+Na cestu **z hotelu na letiště**: stačí **čas vyzvednutí u hotelu**.
+**Ráno 8–9** a **15–17** mohou být **zácpy** (počítejte až **60 min**).
+**Dětské sedačky** máme – napište **věk dítěte**.
 
+Potvrzení k odeslání hostovi:
+“I arranged the pick-up for you. The driver will be waiting in the arrival hall with your name on a sign. In case you can’t find each other, please call +420 722 705 919. The price is 31 EUR / 750 CZK (cash or card to the driver).”
+(Pro 5–8 osob / hodně zavazadel: **42 EUR / 1000 CZK**.)
+`.trim(),
+      stairs: `
+**Bezbariérovost / schody**
+- Do budovy jsou **2 schody**, do apartmánu **001** v přízemí je **1 schod**.
+- Jinak bez schodů a s **velkým výtahem**.
+- Sprchové kouty mají **cca 30 cm** práh vaničky.
+`.trim(),
+      ac: `
+**AC (klimatizace)**
+- Režim **Sun = topení**, **Snowflake = chlazení**.
+- Pokud **bliká zelená** na AC, je potřeba **restart**: na **balkonu 2. patra** jsou vypínače AC – **vypnout ~30 s, pak zapnout**.
+`.trim(),
+      power: `
+**Elektřina – jističe**
+- Nejdřív zkontrolujte **jističe v apartmánu** (malá bílá dvířka ve zdi).
+- Pokud je problém dál, u balkonu jsou **hlavní troj-jističe**; spadlý bude jako **jediný dole**.
+`.trim(),
+      luggage: `
+**Úschovna zavazadel**
+- **Příjezd před 11:00**: uložte věci v **bagážovně**.
+- **Po check-outu (po 11:00)**: můžete uložit věci v bagážovně, nebo je ponechat v apartmánu a **vrátit se později**. Pokud uvidíte, že je už **uklizeno**, můžete **zůstat**.
+`.trim(),
+      balcony: `
+**Číslování a balkony**
+- První číslo apartmánu = **patro** (001 přízemí, 101 1. patro, …).
+- **Balkony** mají: **105, 205, 305**. Ostatní mohou využít **společné balkony** u výtahu na každém patře.
+`.trim(),
+      pets: `
 **Zvířata**
 - **Psi jsou vítáni a zdarma**, jen prosíme **ne na postele/gauče**.
+`.trim(),
+      checkin: `
+**Self check-in / klíče**
+- Kód do boxu a **číslo apartmánu pošle David** před příjezdem.
+- V bagážovně jsou **náhradní klíče** podle čísla apartmánu:
+  001→3301, 101→3302, 102→3303, 103→3304, 104→3305, 105→3306,
+  201→3307, 202→3308, 203→3309, 204→3310, 205→3311,
+  301→3312, 302→3313, 303→3314, 304→3315, 305→3316.
+  Po použití prosíme **číselník zamíchat** a klíč **vrátit na místo**.
+`.trim(),
+    };
 
-**Taxi (letiště)**
-- Pro objednání potřebujeme: **číslo letu**, **čas příletu**, **telefon**, **počet osob a kufrů**, a zda **stačí sedan** nebo je potřeba **větší vůz**.  
-- Na cestu **z hotelu na letiště** stačí čas vyzvednutí u hotelu.  
-- **Ráno 8–9** a **15–17** mohou být **zácpy** (počítejte až **60 min**).  
-- **Dětské sedačky** máme – napište **věk dítěte**.  
-- Potvrzení:  
-  *“I arranged the pick-up for you. The driver will be waiting in the arrival hall with your name on a sign. In case you can’t find each other, please call +420 722 705 919. The price is 31 EUR / 750 CZK (cash or card to the driver).”*  
-  (Pro 5–8 osob nebo hodně zavazadel: **42 EUR / 1000 CZK**.)
-`.trim();
-
+    // ---------- Média blok ----------
     function mediaBlock() {
       if (!Array.isArray(MEDIA) || MEDIA.length === 0) return "";
       const lines = MEDIA.map((m, i) => {
@@ -363,9 +301,17 @@ Pokud Wi-Fi nefunguje: zkontrolujte kabely a zkuste **restart** (vytáhnout nap�
     // ---------- LOGIKA ----------
     const lastUserText =
       [...messages].reverse().find((m) => m.role === "user")?.content || "";
-    let parsed = parseDatesStrict(lastUserText);
+    const intent = detectIntent(lastUserText);
 
-    // když datum není v poslední zprávě, zkusit vzít rozsah z historie
+    // --- Pokud dotaz NENÍ o parkování → vrať příslušnou sekci (přeloženou) ---
+    if (intent && intent !== "parking") {
+      const cz = SECTIONS_CZ[intent] || "Mohu poradit s ubytováním, Wi-Fi, taxi nebo parkováním. Zeptejte se prosím konkrétněji 🙂";
+      const reply = await translateIfNeeded(cz, messages);
+      return ok(reply);
+    }
+
+    // --- PARKING FLOW (pouze když je to opravdu o parkování) ---
+    let parsed = parseDatesStrict(lastUserText);
     let effectiveRange = parsed.confirmed || rangeFromHistory(messages);
 
     // načíst dostupnost pro každou NOC (from..to-1)
@@ -426,6 +372,43 @@ Pokud Wi-Fi nefunguje: zkontrolujte kabely a zkuste **restart** (vytáhnout nap�
     }
 
     // extrahovat detaily (jméno/SPZ/čas)
+    function extractDetails(msgs) {
+      const t =
+        ([...msgs].reverse().find((m) => m.role === "user")?.content || "").trim();
+      if (!t) return null;
+      const timeMatch = t.match(/(\b\d{1,2}[:.]\d{2}\b)/);
+      const arrival = timeMatch ? timeMatch[1].replace(".", ":") : null;
+      const parts = t
+        .split(/[,;\n]/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+      let plate = null;
+      for (const p of parts) {
+        const c = p.replace(/\s+/g, "");
+        if (/^[A-Za-z0-9-]{5,}$/.test(c)) {
+          plate = c.toUpperCase();
+          break;
+        }
+      }
+      let name = null;
+      for (const p of parts) {
+        const clean = p.replace(/\s+/g, " ").trim();
+        if (arrival && clean.includes(arrival)) continue;
+        if (plate && clean.replace(/\s+/g, "").toUpperCase() === plate) continue;
+        if (clean.length >= 3) {
+          name = clean;
+          break;
+        }
+      }
+      if (!name && !plate && !arrival) return null;
+      return {
+        guest_name: name || "",
+        car_plate: plate || "",
+        arrival_time: arrival || "",
+      };
+    }
+
     const details = extractDetails(messages);
 
     // pokus o rezervaci, pokud máme všechno
@@ -471,6 +454,39 @@ Pokud Wi-Fi nefunguje: zkontrolujte kabely a zkuste **restart** (vytáhnout nap�
 
       if (!failed) {
         const list = AVAILABILITY.days.map((d) => `• ${d.date}`).join("\n");
+
+        const parkingInstructionsCZ = `
+**Parkování a příjezd**
+- Rezervované parkování je k dispozici od **12:00** v den příjezdu.
+- V den odjezdu je **check-out z pokoje do 11:00**. Ponechání auta po 11:00 je možné **jen dle dostupnosti** – napište, potvrdíme.
+- Průjezd do dvora je **úzký (šířka 220 cm)**, ale **výška je neomezená** – projede i vysoké auto.
+- Když je parkoviště plné a potřebujete jen vyložit věci: na **chodníku před domem** (mezi naším a vedlejším vjezdem) lze zastavit cca **10 minut**. (Viz foto níže.)
+
+**Self check-in / klíče**
+- Kód do boxu a **číslo apartmánu pošle David** před příjezdem.
+- V bagážovně jsou **náhradní klíče** podle čísla apartmánu:
+  001→3301, 101→3302, 102→3303, 103→3304, 104→3305, 105→3306,
+  201→3307, 202→3308, 203→3309, 204→3310, 205→3311,
+  301→3312, 302→3313, 303→3314, 304→3315, 305→3316.
+  Po použití prosíme **číselník zamíchat** a klíč **vrátit na místo**.
+
+${SECTIONS_CZ.luggage}
+
+${SECTIONS_CZ.stairs}
+
+${SECTIONS_CZ.balcony}
+
+${SECTIONS_CZ.power}
+
+${SECTIONS_CZ.ac}
+
+${SECTIONS_CZ.wifi}
+
+${SECTIONS_CZ.pets}
+
+${SECTIONS_CZ.taxi}
+`.trim();
+
         const instr = await translateIfNeeded(parkingInstructionsCZ, messages);
 
         const reply =
@@ -494,12 +510,14 @@ ${instr}${mediaBlock()}`;
     // pokud máme dostupnost, ale ne detaily → vypiš dostupnost
     if (AVAILABILITY) return ok(AVAILABILITY.text);
 
-    // pokud nemáme nic → ukaž formát dat
-    if (!parsed.confirmed && parsed.ask) return ok(parsed.ask);
+    // pokud dotaz je o parkování, ale nebyl rozpoznán rozsah → popros o formát
+    if (intent === "parking") {
+      const ask = parseDatesStrict(lastUserText).ask;
+      return ok(ask || "Napište prosím datum ve formátu **DD.MM.–DD.MM.YYYY**.");
+    }
 
-    return ok(
-      "Pro rezervaci napište prosím datum ve formátu **DD.MM.–DD.MM.YYYY** (např. **20.09.–24.09.2025**)."
-    );
+    // fallback (nemělo by nastat)
+    return ok("Rád poradím s ubytováním, parkováním, Wi-Fi nebo taxi. Jak vám mohu pomoci?");
   } catch (err) {
     return new Response(
       JSON.stringify({ reply: `⚠️ Server error: ${String(err)}` }),
