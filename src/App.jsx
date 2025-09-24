@@ -4,7 +4,26 @@ import DOMPurify from 'dompurify'
 
 export default function App(){
   const [chat, setChat] = useState([
-    { role: 'assistant', content: 'Hello! I\'m the CHILL Apartments assistant. How can I help you today?' }
+    {
+      role: 'assistant',
+      content: [
+        'Vítejte v **CHILL Apartments**! ✨',
+        '',
+        'Abych vám mohl co nejlépe pomoci, napište prosím:',
+        '- **Datum a čas příjezdu** (např. 28.09.2025 18:30)',
+        '- zda potřebujete **parkování**',
+        '- zda chcete **taxi** z/na letiště',
+        '',
+        '**Self check-in**',
+        '- Kód do boxu a **číslo apartmánu pošle David** před příjezdem.',
+        '',
+        '**Úschova zavazadel**',
+        '- Příjezd **před 14:00** – můžete uložit zavazadla do **bagážovny**.',
+        '- Po **check-outu (11:00)** – můžete uložit věci v **bagážovně**.',
+        '',
+        '_Fotky příjezdu/parkování přidáme sem později._'
+      ].join('\n')
+    }
   ])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
@@ -30,7 +49,7 @@ export default function App(){
       const data = await r.json()
       setChat([...next, { role: 'assistant', content: data.reply }])
     }catch(e){
-      setChat([...next, { role: 'assistant', content: 'Sorry, something went wrong.' }])
+      setChat([...next, { role: 'assistant', content: 'Omlouvám se, něco se pokazilo. Zkuste to prosím znovu.' }])
       console.error(e)
     }finally{
       setLoading(false)
@@ -66,7 +85,7 @@ export default function App(){
         <div className="flex gap-2 mt-3">
           <input
             className="flex-1 input"
-            placeholder="Type here (any language)…"
+            placeholder="Napište datum a čas příjezdu, parkování a/nebo taxi…"
             value={input}
             onChange={e=>setInput(e.target.value)}
             onKeyDown={e=> e.key==='Enter' && send()}
@@ -75,7 +94,7 @@ export default function App(){
         </div>
 
         <footer className="mt-4 text-xs opacity-60">
-          Tip: You can paste your booking link to get tailored instructions.
+          Tip: Můžete vložit i odkaz na rezervaci — připravím instrukce na míru.
         </footer>
       </div>
     </div>

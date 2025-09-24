@@ -1,5 +1,5 @@
 // netlify/functions/chat.js
-// Striktní formát dat: "DD.MM.–DD.MM.YYYY" (nebo '-').
+// Striktní formát dat pro PARKING: "DD.MM.–DD.MM.YYYY" (nebo '-').
 // Př.: "20.09.–24.09.2025" → from=2025-09-20, to=2025-09-24 (nocí: 4).
 // „Měkký pád“: nikdy 500; vždy vrací 200 s JSON { reply } k zobrazení.
 
@@ -43,7 +43,7 @@ export default async (req) => {
     const HOTEL = (await loadJSON("/data/hotel.json")) || {};
     const MEDIA = (await loadJSON("/data/parking_media.json")) || [];
 
-    // ---------- Překladač (definováno včas) ----------
+    // ---------- Překladač ----------
     async function callOpenAI(msgs) {
       if (!OPENAI_API_KEY) {
         return msgs.find((m) => m.role === "user")?.content || "";
@@ -63,7 +63,6 @@ export default async (req) => {
         return data.choices?.[0]?.message?.content || "";
       } catch { return `Translator bad json: ${txt}`; }
     }
-
     async function translateIfNeeded(text, userMsgs) {
       if (!TRANSLATE_INSTRUCTIONS) return text;
       const sample = ([...userMsgs].reverse().find((m) => m.role === "user")?.content || "").slice(0, 500);
@@ -81,64 +80,54 @@ export default async (req) => {
       Object.entries(obj || {}).forEach(([k, v]) => u.searchParams.set(k, String(v)));
       return u.toString();
     }
-
     async function gsGetParking(dateISO) {
       try {
         const r = await fetch(qs({ fn: "parking", date: dateISO }), { redirect: "follow" });
         const txt = await r.text();
-        if (!r.ok) {
-          console.error("gsGetParking error", r.status, txt?.slice(0, 300));
-          return { ok: false, error: `GET ${r.status}`, raw: txt?.slice(0, 300) };
-        }
-        try { return JSON.parse(txt); }
-        catch { console.error("gsGetParking bad json", txt?.slice(0, 300)); return { ok:false, error:"Bad JSON from GET", raw: txt?.slice(0,300) }; }
-      } catch (e) { console.error("gsGetParking exception", e); return { ok:false, error:String(e) }; }
+        if (!r.ok) return { ok: false, error: `GET ${r.status}`, raw: txt?.slice(0, 300) };
+        try { return JSON.parse(txt); } catch { return { ok:false, error:"Bad JSON from GET", raw: txt?.slice(0,300) }; }
+      } catch (e) { return { ok:false, error:String(e) }; }
     }
-
     async function gsPostBook(dateISO, who, note) {
       try {
         const r = await fetch(PARKING_API_URL, {
-          method: "POST",
-          redirect: "follow",
+          method: "POST", redirect: "follow",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ action: "book", date: dateISO, who, note: note || "", apiKey: PARKING_WRITE_KEY || undefined }),
         });
         const txt = await r.text();
-        if (!r.ok) { console.error("gsPostBook error", r.status, txt?.slice(0, 300)); return { ok:false, error:`POST ${r.status}`, raw: txt?.slice(0,300) }; }
-        try { return JSON.parse(txt); }
-        catch { console.error("gsPostBook bad json", txt?.slice(0, 300)); return { ok:false, error:"Bad JSON from POST", raw: txt?.slice(0,300) }; }
-      } catch (e) { console.error("gsPostBook exception", e); return { ok:false, error:String(e) }; }
+        if (!r.ok) return { ok:false, error:`POST ${r.status}`, raw: txt?.slice(0,300) };
+        try { return JSON.parse(txt); } catch { return { ok:false, error:"Bad JSON from POST", raw: txt?.slice(0,300) }; }
+      } catch (e) { return { ok:false, error:String(e) }; }
     }
-
     async function gsPostCancel(dateISO, who) {
       try {
         const r = await fetch(PARKING_API_URL, {
-          method: "POST",
-          redirect: "follow",
+          method: "POST", redirect: "follow",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ action: "cancel", date: dateISO, who, apiKey: PARKING_WRITE_KEY || undefined }),
         });
         const txt = await r.text();
-        if (!r.ok) { console.error("gsPostCancel error", r.status, txt?.slice(0, 300)); return { ok:false, error:`POST ${r.status}`, raw: txt?.slice(0,300) }; }
-        try { return JSON.parse(txt); }
-        catch { console.error("gsPostCancel bad json", txt?.slice(0, 300)); return { ok:false, error:"Bad JSON from POST", raw: txt?.slice(0,300) }; }
-      } catch (e) { console.error("gsPostCancel exception", e); return { ok:false, error:String(e) }; }
+        if (!r.ok) return { ok:false, error:`POST ${r.status}`, raw: txt?.slice(0,300) };
+        try { return JSON.parse(txt); } catch { return { ok:false, error:"Bad JSON from POST", raw: txt?.slice(0,300) }; }
+      } catch (e) { return { ok:false, error:String(e) }; }
     }
 
-    // ---------- Utils ----------
+    // ---------- Date utils ----------
     const toISODate = (d) => d.toISOString().slice(0, 10);
     const daysInMonth = (y, m) => new Date(y, m, 0).getDate();
     const clamp = (y, m, d) => Math.min(Math.max(1, d), daysInMonth(y, m));
     const fmtISO = (y, m, d) => `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
 
+    // PARKING – striktní rozsah nocí
     function parseDatesStrict(text) {
       const t = (text || "").trim();
       const re = /(^|.*?\s)\b(\d{2})\.(\d{2})\.\s*[–-]\s*(\d{2})\.(\d{2})\.(\d{4})\b/;
       const m = re.exec(t);
       if (!m) {
-        const ask = "Pro rezervaci parkování mi prosím napište datum **pouze** v tomto formátu:\n\n" +
+        const ask = "Pro rezervaci parkování napište datum **přesně** ve tvaru:\n\n" +
                     "**DD.MM.–DD.MM.YYYY** (např. **20.09.–24.09.2025**)\n\n" +
-                    'Použijte buď pomlčku "-", nebo en-dash "–" mezi dny.';
+                    'Mezi dny použijte pomlčku "-" nebo en-dash "–".';
         return { confirmed: null, ask };
       }
       const d1 = +m[2], m1 = +m[3], d2 = +m[4], m2 = +m[5], y = +m[6];
@@ -150,7 +139,6 @@ export default async (req) => {
       const to = isoA <= isoB ? isoB : isoA; // den odjezdu (exkluzivně)
       return { confirmed: { from, to }, ask: null };
     }
-
     function rangeFromHistory(msgs) {
       for (let i = msgs.length - 1; i >= 0; i--) {
         const m = msgs[i]; if (!m || !m.content) continue;
@@ -160,14 +148,51 @@ export default async (req) => {
       return null;
     }
 
+    // ---------- Onboarding extrakce (datum/čas příjezdu, parking, taxi) ----------
+    function extractArrivalDateTime(text) {
+      const t = (text || "").trim();
+
+      // 1) Datum + čas: "DD.MM.YYYY HH:mm" nebo "DD.MM.YYYY H:mm"
+      const reDT = /\b(\d{2})\.(\d{2})\.(\d{4})(?:[ T]+(\d{1,2})[:.](\d{2}))?\b/;
+      const m = reDT.exec(t);
+      let dateISO = null, timeHHMM = null;
+      if (m) {
+        const d = clamp(+m[3], +m[2], +m[1]);
+        dateISO = fmtISO(+m[3], +m[2], d);
+        if (m[4] && m[5]) {
+          const hh = String(Math.max(0, Math.min(23, +m[4]))).padStart(2, "0");
+          const mm = String(Math.max(0, Math.min(59, +m[5]))).padStart(2, "0");
+          timeHHMM = `${hh}:${mm}`;
+        }
+      }
+
+      // 2) Samostatný čas: "HH:mm" nebo "H.mm"
+      if (!timeHHMM) {
+        const timeOnly = /(^|\s)(\d{1,2})[:.](\d{2})(\s|$)/.exec(t);
+        if (timeOnly) {
+          const hh = String(Math.max(0, Math.min(23, +timeOnly[2]))).padStart(2, "0");
+          const mm = String(Math.max(0, Math.min(59, +timeOnly[3]))).padStart(2, "0");
+          timeHHMM = `${hh}:${mm}`;
+        }
+      }
+
+      return { arrival_date: dateISO, arrival_time: timeHHMM };
+    }
+    function wantsParking(text) {
+      return /(park|parking|parkování|garáž|garage|auto)/i.test(text || "");
+    }
+    function wantsTaxi(text) {
+      return /(taxi|airport|letiště|pick ?up|transfer)/i.test(text || "");
+    }
+
     // ---------- Intenty (router) ----------
     function detectIntent(text) {
-      const t = (text || "").toLowerCase();
-      const hasDate = /(\d{2})\.(\d{2})\.\s*[–-]\s*(\d{2})\.(\d{2})\.(\d{4})/.test(t);
-      const parkingKW = /(park|parking|parkování|auto|spz|car|garage|garáž)/i.test(text);
-      if (hasDate || parkingKW) return "parking";
+      const t = (text || "");
+      const hasParkingRange = /(\d{2})\.(\d{2})\.\s*[–-]\s*(\d{2})\.(\d{2})\.(\d{4})/.test(t);
+      const parkingKW = wantsParking(t);
+      if (hasParkingRange || parkingKW) return "parking";
       if (/(wifi|wi-?fi|internet)/i.test(t)) return "wifi";
-      if (/(taxi|airport|letiště|pick ?up|transfer)/i.test(t)) return "taxi";
+      if (wantsTaxi(t)) return "taxi";
       if (/(schod|stairs|handicap|wheelchair|invalid)/i.test(t)) return "stairs";
       if (/\bac\b|klima|air ?con|airconditioning|air-conditioning/i.test(t)) return "ac";
       if (/(elektr|jistič|fuse|breaker|power|electric)/i.test(t)) return "power";
@@ -175,7 +200,7 @@ export default async (req) => {
       if (/(balkon|balcony)/i.test(t)) return "balcony";
       if (/(pes|dog|pet|zvíř|animals)/i.test(t)) return "pets";
       if (/(check[- ]?in|check[- ]?out|arrival|příjezd|odjezd|welcome|instructions?)/i.test(t)) return "checkin";
-      return "unknown";
+      return "onboarding"; // default – první kontakt
     }
 
     // ---------- Sekce (CZ) pro ne-parkovací odpovědi ----------
@@ -204,7 +229,7 @@ Pokud Wi-Fi nefunguje: zkontrolujte kabely a zkuste **restart** (vytáhnout nap�
       taxi: `
 **Taxi (letiště)**
 Pro objednání potřebujeme: **číslo letu**, **čas příletu**, **telefon**, **počet osob a kufrů**, a zda **stačí sedan** nebo je potřeba **větší vůz**.
-Na cestu **z hotelu na letiště**: stačí **čas vyzvednutí u hotelu**.
+Na cestu **z hotelu na letiště**: uveďte **čas vyzvednutí u hotelu**.
 **Ráno 8–9** a **15–17** mohou být **zácpy** (počítejte až **60 min**).
 **Dětské sedačky** máme – napište **věk dítěte**.
 
@@ -230,8 +255,8 @@ Potvrzení k odeslání hostovi:
 `.trim(),
       luggage: `
 **Úschovna zavazadel**
-- **Příjezd před 11:00**: uložte věci v **bagážovně**.
-- **Po check-outu (po 11:00)**: můžete uložit věci v bagážovně, nebo je ponechat v apartmánu a **vrátit se později**. Pokud uvidíte, že je už **uklizeno**, můžete **zůstat**.
+- **Příjezd před 14:00** – můžete uložit zavazadla do **bagážovny**.
+- **Po check-outu (11:00)** – můžete uložit věci v **bagážovně**.
 `.trim(),
       balcony: `
 **Číslování a balkony**
@@ -245,11 +270,7 @@ Potvrzení k odeslání hostovi:
       checkin: `
 **Self check-in / klíče**
 - Kód do boxu a **číslo apartmánu pošle David** před příjezdem.
-- V bagážovně jsou **náhradní klíče** podle čísla apartmánu:
-  001→3301, 101→3302, 102→3303, 103→3304, 104→3305, 105→3306,
-  201→3307, 202→3308, 203→3309, 204→3310, 205→3311,
-  301→3312, 302→3313, 303→3314, 304→3315, 305→3316.
-  Po použití prosíme **číselník zamíchat** a klíč **vrátit na místo**.
+- (Náhradní klíče jsou v bagážovně – pošleme jen pokud nastane problém.)
 `.trim(),
     };
 
@@ -268,14 +289,74 @@ Potvrzení k odeslání hostovi:
     const lastUserText = [...messages].reverse().find((m) => m.role === "user")?.content || "";
     const intent = detectIntent(lastUserText);
 
-    // --- Pokud dotaz NENÍ o parkování → vrať příslušnou sekci (přeloženou) ---
-    if (intent && intent !== "parking") {
+    // === 1) ONBOARDING (výchozí) ===
+    if (intent === "onboarding") {
+      const { arrival_date, arrival_time } = extractArrivalDateTime(lastUserText);
+      const wantPark = wantsParking(lastUserText);
+      const wantTaxi = wantsTaxi(lastUserText);
+
+      // Co chybí?
+      const missing = [];
+      if (!arrival_date) missing.push("**datum příjezdu (DD.MM.YYYY)**");
+      if (!arrival_time) missing.push("**čas příjezdu (HH:mm)**");
+
+      // Když chybí datum/čas → cílená výzva
+      if (missing.length) {
+        const baseText = [
+          "Abych připravil vše na váš příjezd, napište prosím:",
+          `- ${missing.join(" a ")}`,
+          "- zda potřebujete **parkování**",
+          "- zda chcete **taxi** z/na letiště",
+          "",
+          "**Self check-in**",
+          "- Kód do boxu a **číslo apartmánu pošle David** před příjezdem.",
+          "",
+          "**Úschova zavazadel**",
+          "- **Příjezd před 14:00** – můžete uložit zavazadla do **bagážovny**.",
+          "- **Po check-outu (11:00)** – můžete uložit věci v **bagážovně**.",
+          "",
+          "_Fotky příjezdu/parkování doplníme později._",
+        ].join("\n");
+        const reply = await translateIfNeeded(baseText, messages);
+        return ok(reply);
+      }
+
+      // Máme datum i čas → pošli shrnutí + další instrukce
+      const block = `
+**Děkuji! Zapsal jsem si příjezd:** ${arrival_date} ${arrival_time}
+
+**Self check-in**
+- Kód do boxu a **číslo apartmánu pošle David** před příjezdem.
+
+**Úschova zavazadel**
+- **Příjezd před 14:00** – můžete uložit zavazadla do **bagážovny**.
+- **Po check-outu (11:00)** – můžete uložit věci v **bagážovně**.
+
+${
+  wantPark
+    ? "\nPokud chcete **parkování**, napište prosím termín ve tvaru **DD.MM.–DD.MM.YYYY** (den odjezdu je bez noci)."
+    : "Máte zájem o **parkování**? Napište, prosím, termín ve tvaru **DD.MM.–DD.MM.YYYY**."
+}
+${
+  wantTaxi
+    ? "\nU **taxi** prosím pošlete **číslo letu**, **čas příletu**, **telefon**, **počet osob a kufrů**."
+    : "Chcete **taxi**? Stačí **číslo letu**, **čas příletu**, **telefon**, **počet osob a kufrů**."
+}
+${mediaBlock()}
+`.trim();
+
+      const reply = await translateIfNeeded(block, messages);
+      return ok(reply);
+    }
+
+    // === 2) NE-PARKOVACÍ KRÁTKÉ SEKCE ===
+    if (intent && !["parking","onboarding"].includes(intent)) {
       const cz = SECTIONS_CZ[intent] || "Mohu poradit s ubytováním, Wi-Fi, taxi nebo parkováním. Zeptejte se prosím konkrétněji 🙂";
       const reply = await translateIfNeeded(cz, messages);
       return ok(reply);
     }
 
-    // --- PARKING FLOW (pouze když je to opravdu o parkování) ---
+    // === 3) PARKING FLOW (jen když je to o parkování) ===
     let parsed = parseDatesStrict(lastUserText);
     let effectiveRange = parsed.confirmed || rangeFromHistory(messages);
 
@@ -316,14 +397,13 @@ ${allFree
       };
     }
 
-    // extrahovat detaily (jméno/SPZ/čas)
+    // extrahovat detaily (jméno/SPZ/čas) – pro rychlý zápis
     function extractDetails(msgs) {
       const t = ([...msgs].reverse().find((m) => m.role === "user")?.content || "").trim();
       if (!t) return null;
       const timeMatch = t.match(/(\b\d{1,2}[:.]\d{2}\b)/);
       const arrival = timeMatch ? timeMatch[1].replace(".", ":") : null;
       const parts = t.split(/[,;\n]/).map((s) => s.trim()).filter(Boolean);
-
       let plate = null;
       for (const p of parts) {
         const c = p.replace(/\s+/g, "");
@@ -339,16 +419,15 @@ ${allFree
       if (!name && !plate && !arrival) return null;
       return { guest_name: name || "", car_plate: plate || "", arrival_time: arrival || "" };
     }
-
     const details = extractDetails(messages);
 
     // pokus o rezervaci, pokud máme všechno
     if (AVAILABILITY && AVAILABILITY.allFree && AVAILABILITY.nights > 0 && details && details.guest_name && details.car_plate) {
-      const who = `${details.guest_name} / ${details.car_plate}`.trim(); // ukládáme jako "Jméno / SPZ"
+      const who = `${details.guest_name} / ${details.car_plate}`.trim();
       const bookedDates = [];
       let failed = null;
 
-      // 1) ještě jednou ověřit volno pro každý den (race condition)
+      // 1) re-check volno (race condition)
       for (const d of AVAILABILITY.days) {
         const check = await gsGetParking(d.date);
         if (!check?.ok || (Number(check.free) || 0) <= 0) { failed = { date: d.date, reason: "No free spot" }; break; }
@@ -363,54 +442,32 @@ ${allFree
         }
       }
 
-      // 3) rollback, pokud něco spadlo
+      // 3) rollback
       if (failed && bookedDates.length) {
         for (const date of bookedDates.reverse()) { await gsPostCancel(date, who).catch(() => {}); }
       }
 
       if (!failed) {
         const list = AVAILABILITY.days.map((d) => `• ${d.date}`).join("\n");
-
         const parkingInstructionsCZ = `
 **Parkování a příjezd**
 - Rezervované parkování je k dispozici od **12:00** v den příjezdu.
 - V den odjezdu je **check-out z pokoje do 11:00**. Ponechání auta po 11:00 je možné **jen dle dostupnosti** – napište, potvrdíme.
 - Průjezd do dvora je **úzký (šířka 220 cm)**, ale **výška je neomezená** – projede i vysoké auto.
-- Když je parkoviště plné a potřebujete jen vyložit věci: na **chodníku před domem** (mezi naším a vedlejším vjezdem) lze zastavit cca **10 minut**. (Viz foto níže.)
+- Když je parkoviště plné a potřebujete jen vyložit věci: na **chodníku před domem** (mezi naším a vedlejším vjezdem) lze zastavit cca **10 minut**.
 
-**Self check-in / klíče**
-- Kód do boxu a **číslo apartmánu pošle David** před příjezdem.
-- V bagážovně jsou **náhradní klíče** podle čísla apartmánu:
-  001→3301, 101→3302, 102→3303, 103→3304, 104→3305, 105→3306,
-  201→3307, 202→3308, 203→3309, 204→3310, 205→3311,
-  301→3302, 302→3313, 303→3314, 304→3315, 305→3316.
-  Po použití prosíme **číselník zamíchat** a klíč **vrátit na místo**.
+${SECTIONS_CZ.checkin}
 
 ${SECTIONS_CZ.luggage}
-
-${SECTIONS_CZ.stairs}
-
-${SECTIONS_CZ.balcony}
-
-${SECTIONS_CZ.power}
-
-${SECTIONS_CZ.ac}
-
-${SECTIONS_CZ.wifi}
-
-${SECTIONS_CZ.pets}
-
-${SECTIONS_CZ.taxi}
-`.trim();
-
-        const instr = await translateIfNeeded(parkingInstructionsCZ, messages);
+`;
+        const instr = await translateIfNeeded(parkingInstructionsCZ + "\n" + mediaBlock(), messages);
 
         const reply =
 `✅ Rezervace zapsána (${AVAILABILITY.nights} nocí):
 ${list}
 Host: ${details.guest_name}, SPZ: ${details.car_plate}, příjezd: ${details.arrival_time || "neuvedeno"}
 
-${instr}${mediaBlock()}`;
+${instr}`;
         return ok(reply);
       } else {
         const why = failed.reason + (failed.raw ? `\nRaw: ${String(failed.raw).slice(0, 300)}` : "");
@@ -424,10 +481,10 @@ ${instr}${mediaBlock()}`;
     // pokud dotaz je o parkování, ale nebyl rozpoznán rozsah → popros o formát
     if (intent === "parking") {
       const ask = parseDatesStrict(lastUserText).ask;
-      return ok(ask || "Napište prosím datum ve formátu **DD.MM.–DD.MM.YYYY**.");
+      return ok(ask || "Napište prosím termín parkování ve formátu **DD.MM.–DD.MM.YYYY**.");
     }
 
-    // fallback (nemělo by nastat)
+    // fallback
     return ok("Rád poradím s ubytováním, parkováním, Wi-Fi nebo taxi. Jak vám mohu pomoci?");
   } catch (err) {
     return new Response(JSON.stringify({ reply: `⚠️ Server error: ${String(err)}` }), {
