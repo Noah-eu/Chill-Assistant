@@ -43,21 +43,15 @@ export default async (req) => {
     const HOTEL = (await loadJSON("/data/hotel.json")) || {};
     const MEDIA = (await loadJSON("/data/parking_media.json")) || [];
 
-    // ---------- Heuristika jazyka ----------
+    // ---------- Jazyk & překlad ----------
+    function lastUserTextOf(msgs){ return [...msgs].reverse().find(m=>m.role==='user')?.content || ''; }
     function userSeemsCzech(text) {
       const t = (text || "").toLowerCase();
       return /[ěščřžýáíéúůďťň]/.test(t) ||
              /(ahoj|dobrý|dobry|prosím|prosim|děkuji|dekuji|příjezd|prijezd|parkování|parkovani|letiště|letiste)/.test(t);
     }
-    function lastUserTextOf(msgs){
-      return [...msgs].reverse().find(m=>m.role==='user')?.content || '';
-    }
-
-    // ---------- Překladač ----------
     async function callOpenAI(msgs) {
-      if (!OPENAI_API_KEY) {
-        return msgs.find((m) => m.role === "user")?.content || "";
-      }
+      if (!OPENAI_API_KEY) return msgs.find((m) => m.role === "user")?.content || "";
       const r = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
         headers: {
@@ -74,10 +68,8 @@ export default async (req) => {
       } catch { return `Translator bad json: ${txt}`; }
     }
     async function translateIfNeeded(text, userMsgs) {
-      // nepřekládej, pokud to vypadá na češtinu
       const sample = lastUserTextOf(userMsgs);
-      if (!TRANSLATE_INSTRUCTIONS || userSeemsCzech(sample)) return text;
-
+      if (!TRANSLATE_INSTRUCTIONS || userSeemsCzech(sample)) return text; // čeština → nepřekládat
       const msgs = [
         { role: "system", content: "You are a precise translator. Keep meaning and formatting. If source equals target language, return as is." },
         { role: "user", content: `User language sample:\n---\n${sample}\n---\nTranslate:\n${text}` },
@@ -136,12 +128,11 @@ export default async (req) => {
       const t = (text || "").trim();
       const re = /(^|.*?\s)\b(\d{2})\.(\d{2})\.\s*[–-]\s*(\d{2})\.(\d{2})\.(\d{4})\b/;
       const m = re.exec(t);
-      if (!m) {
-        const ask = "Pro rezervaci parkování napište datum **přesně** ve tvaru:\n\n" +
-                    "**DD.MM.–DD.MM.YYYY** (např. **20.09.–24.09.2025**)\n\n" +
-                    'Mezi dny použijte pomlčku "-" nebo en-dash "–".';
-        return { confirmed: null, ask };
-      }
+      if (!m) return { confirmed: null, ask:
+        "Pro rezervaci parkování napište datum **přesně** ve tvaru:\n\n" +
+        "**DD.MM.–DD.MM.YYYY** (např. **20.09.–24.09.2025**)\n\n" +
+        'Mezi dny použijte pomlčku "-" nebo en-dash "–".'
+      };
       const d1 = +m[2], m1 = +m[3], d2 = +m[4], m2 = +m[5], y = +m[6];
       const a = { y, mo: m1, d: clamp(y, m1, d1) };
       const b = { y, mo: m2, d: clamp(y, m2, d2) };
@@ -163,7 +154,6 @@ export default async (req) => {
     // ---------- Onboarding extrakce ----------
     function extractArrivalDateTime(text) {
       const t = (text || "").trim();
-
       // "DD.MM.YYYY HH:mm" nebo bez času
       const reDT = /\b(\d{2})\.(\d{2})\.(\d{4})(?:[ T]+(\d{1,2})[:.](\d{2}))?\b/;
       const m = reDT.exec(t);
@@ -177,7 +167,6 @@ export default async (req) => {
           timeHHMM = `${hh}:${mm}`;
         }
       }
-
       // samostatný čas
       if (!timeHHMM) {
         const timeOnly = /(^|\s)(\d{1,2})[:.](\d{2})(\s|$)/.exec(t);
@@ -193,9 +182,20 @@ export default async (req) => {
     function wantsTaxi(text)    { return /(taxi|airport|letiště|pick ?up|transfer)/i.test(text || ""); }
     function saysOneNight(text) { return /(1\s*noc|jednu\s*noc|one\s*night)/i.test(text || ""); }
 
+    // Pomocné: odvoď rozsah (1 noc) z data příjezdu
+    function deriveOneNightRangeFromArrival(text) {
+      const { arrival_date } = extractArrivalDateTime(text);
+      if (!arrival_date) return null;
+      const start = new Date(arrival_date + "T00:00:00Z");
+      const next = new Date(start); next.setUTCDate(next.getUTCDate() + 1);
+      return { from: arrival_date, to: toISODate(next) };
+    }
+
     // ---------- Intenty ----------
     function detectIntent(text) {
       const t = (text || "");
+      // pokud má "jednu noc" + datum → ber jako parking (abychom netrvali na rozsahu)
+      if (saysOneNight(t) && extractArrivalDateTime(t).arrival_date) return "parking";
       const hasParkingRange = /(\d{2})\.(\d{2})\.\s*[–-]\s*(\d{2})\.(\d{2})\.(\d{4})/.test(t);
       const parkingKW = wantsParking(t);
       if (hasParkingRange || parkingKW) return "parking";
@@ -232,7 +232,7 @@ export default async (req) => {
 304→ DA4E / 03274644  
 305→ D5F6 / 45445804
 
-Pokud Wi-Fi nefunguje: zkontrolujte kabely a zkuste **restart** (vytáhnout napájení na 10 s, pak zapnout). Když to nepomůže, napište, **jakou síť vidíte**, pošleme správné heslo.
+Pokud Wi-Fi nefunguje: zkontrolujte kabely a zkuste **restart** (vytáhnout napájení na 10 s, pak zapnout). Když nepomůže, napište, **jakou síť vidíte**, pošleme správné heslo.
 `.trim(),
       taxi: `
 **Taxi (letiště)**
@@ -262,7 +262,7 @@ Potvrzení:
 - Hlavní troj-jističe u balkonu; spadlý bude jako **jediný dole**.
 `.trim(),
       luggage: `
-**Úschovna zavazadel**
+**Úschova zavazadel**
 - **Příjezd před 14:00** – uložte zavazadla do **bagážovny**.
 - **Po check-outu (11:00)** – lze uložit v **bagážovně**.
 `.trim(),
@@ -279,6 +279,14 @@ Potvrzení:
 **Self check-in**
 - Kód do boxu a **číslo apartmánu pošle David** před příjezdem.
 `.trim(),
+      parkingIntro: `
+**Parkování a příjezd**
+- Parkování je za **20 € / noc**.
+- Rezervované parkování je k dispozici od **12:00** v den příjezdu.
+- V den odjezdu je **check-out z pokoje do 11:00**. Ponechání auta po 11:00 je možné **jen dle dostupnosti** – napište, potvrdíme.
+- Průjezd do dvora je **úzký (šířka 220 cm)**, ale **výška je neomezená** – projede i vysoké auto.
+- Když je parkoviště plné a potřebujete jen vyložit věci: na **chodníku před domem** (mezi naším a vedlejším vjezdem) lze zastavit cca **10 minut**.
+`.trim(),
     };
 
     function mediaBlock() {
@@ -291,6 +299,29 @@ Potvrzení:
       return `\n\n**Fotky / mapa / animace:**\n${lines.join("\n")}`;
     }
 
+    // Kompletní uvítací instrukce (CZ)
+    function fullWelcomeCZ() {
+      return (
+`${SECTIONS_CZ.checkin}
+
+${SECTIONS_CZ.luggage}
+
+${SECTIONS_CZ.parkingIntro}
+
+${SECTIONS_CZ.stairs}
+
+${SECTIONS_CZ.balcony}
+
+${SECTIONS_CZ.power}
+
+${SECTIONS_CZ.ac}
+
+${SECTIONS_CZ.wifi}
+
+${SECTIONS_CZ.pets}
+`.trim() + mediaBlock());
+    }
+
     // ---------- LOGIKA ----------
     const lastUser = lastUserTextOf(messages);
     const intent = detectIntent(lastUser);
@@ -300,66 +331,25 @@ Potvrzení:
       const { arrival_date, arrival_time } = extractArrivalDateTime(lastUser);
       const wantPark = wantsParking(lastUser);
       const wantTaxi = wantsTaxi(lastUser);
-      const oneNight = saysOneNight(lastUser);
 
-      // Co chybí?
       const missing = [];
       if (!arrival_date) missing.push("**datum příjezdu (DD.MM.YYYY)**");
       if (!arrival_time) missing.push("**čas příjezdu (HH:mm)**");
 
-      if (missing.length) {
-        const block = [
-          "Abych připravil vše na váš příjezd, napište prosím:",
-          `- ${missing.join(" a ")}`,
-          "- zda potřebujete **parkování**",
-          "- zda chcete **taxi** z/na letiště",
-          "",
-          SECTIONS_CZ.checkin,
-          "",
-          SECTIONS_CZ.luggage,
-          "",
-          "_Fotky příjezdu/parkování doplníme později._",
-        ].join("\n");
-        const reply = await translateIfNeeded(block, messages);
-        return ok(reply);
-      }
+      const askTop = [
+        "Vítejte v **CHILL Apartments**! ✨",
+        "",
+        "Abych vše připravil, napište prosím:",
+        `- ${missing.length ? missing.join(" a ") : "**děkuji, příjezd mám zapsaný**"}`,
+        "- zda potřebujete **parkování**",
+        "- zda chcete **taxi** z/na letiště",
+        "",
+      ].join("\n");
 
-      // Máme datum i čas → shrnutí + nadhození parkování/taxi
-      let extra = "";
-      if (wantPark) {
-        // pokud host píše "jen jednu noc", nabídneme/odvodíme rozsah automaticky
-        if (oneNight && arrival_date) {
-          const start = new Date(arrival_date + "T00:00:00Z");
-          const next = new Date(start); next.setUTCDate(next.getUTCDate() + 1);
-          const from = arrival_date;
-          const to = toISODate(next);
-          extra += `\nChápeme **1 noc** – zkusím zkontrolovat parkování pro **${from} → ${to}**. Napište SPZ a potvrdím.\n`;
-          // vložíme do zpráv syntetický dotaz na dostupnost (aby navazující logika fungovala bez dalšího psaní)
-          messages.push({ role: "user", content: `Parkování: ${from.replaceAll('-', '.')}–${to.replaceAll('-', '.')} ` });
-        } else {
-          extra += `\nMáte zájem o **parkování**? Napište prosím termín ve tvaru **DD.MM.–DD.MM.YYYY**.`;
-        }
-      } else {
-        extra += `\nPotřebujete **parkování**? Napište prosím termín ve tvaru **DD.MM.–DD.MM.YYYY**.`;
-      }
-
-      if (wantTaxi) {
-        extra += `\nU **taxi** prosím pošlete **číslo letu**, **čas příletu**, **telefon**, **počet osob a kufrů**.`;
-      } else {
-        extra += `\nChcete **taxi**? Stačí **číslo letu**, **čas příletu**, **telefon**, **počet osob a kufrů**.`;
-      }
-
-      const block = (
-`**Děkuji! Zapsal jsem si příjezd:** ${arrival_date} ${arrival_time}
-
-${SECTIONS_CZ.checkin}
-
-${SECTIONS_CZ.luggage}
-${mediaBlock()}
-
-${extra}`.trim());
-
-      const reply = await translateIfNeeded(block, messages);
+      const reply = await translateIfNeeded(
+        (askTop + fullWelcomeCZ()).trim(),
+        messages
+      );
       return ok(reply);
     }
 
@@ -371,8 +361,13 @@ ${extra}`.trim());
     }
 
     // === 3) PARKING FLOW ===
+    // 3a) pokud host píše "jen jednu noc" + datum → odvoď rozsah
+    let derived = null;
+    if (saysOneNight(lastUser)) derived = deriveOneNightRangeFromArrival(lastUser);
+
+    // 3b) standardní parser nebo historie
     let parsed = parseDatesStrict(lastUser);
-    let effectiveRange = parsed.confirmed || rangeFromHistory(messages);
+    let effectiveRange = derived || parsed.confirmed || rangeFromHistory(messages);
 
     // načíst dostupnost pro každou NOC (from..to-1)
     let AVAILABILITY = null;
@@ -463,19 +458,7 @@ ${allFree
 
       if (!failed) {
         const list = AVAILABILITY.days.map((d) => `• ${d.date}`).join("\n");
-        const parkingInstructionsCZ = `
-**Parkování a příjezd**
-- Rezervované parkování je k dispozici od **12:00** v den příjezdu.
-- V den odjezdu je **check-out z pokoje do 11:00**. Ponechání auta po 11:00 je možné **jen dle dostupnosti** – napište, potvrdíme.
-- Průjezd do dvora je **úzký (šířka 220 cm)**, ale **výška je neomezená** – projede i vysoké auto.
-- Když je parkoviště plné a potřebujete jen vyložit věci: na **chodníku před domem** (mezi naším a vedlejším vjezdem) lze zastavit cca **10 minut**.
-
-${SECTIONS_CZ.checkin}
-
-${SECTIONS_CZ.luggage}
-`;
-        const instr = await translateIfNeeded(parkingInstructionsCZ + "\n" + mediaBlock(), messages);
-
+        const instr = await translateIfNeeded((SECTIONS_CZ.parkingIntro + "\n\n" + SECTIONS_CZ.checkin + "\n\n" + SECTIONS_CZ.luggage + mediaBlock()).trim(), messages);
         const reply =
 `✅ Rezervace zapsána (${AVAILABILITY.nights} nocí):
 ${list}
@@ -494,12 +477,16 @@ ${instr}`;
 
     // pokud dotaz je o parkování, ale nebyl rozpoznán rozsah → popros o formát
     if (intent === "parking") {
+      // když host napsal "jednu noc" ale nenašli jsme datum, připomeň datum příjezdu
+      if (saysOneNight(lastUser) && !extractArrivalDateTime(lastUser).arrival_date) {
+        return ok("Napište prosím **datum příjezdu (DD.MM.YYYY)** a že je to **na 1 noc**. Pak to hned ověřím.");
+      }
       const ask = parseDatesStrict(lastUser).ask;
       return ok(ask || "Napište prosím termín parkování ve formátu **DD.MM.–DD.MM.YYYY**.");
     }
 
     // fallback
-    return ok("Rád poradím s ubytováním, parkováním, Wi-Fi nebo taxi. Jak vám mohu pomoci?");
+    return ok(await translateIfNeeded("Rád poradím s ubytováním, parkováním, Wi-Fi nebo taxi. Jak vám mohu pomoci?", messages));
   } catch (err) {
     return new Response(JSON.stringify({ reply: `⚠️ Server error: ${String(err)}` }), {
       status: 200, headers: { "content-type": "application/json" }
