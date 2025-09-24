@@ -28,14 +28,6 @@ export default async (req) => {
 
     // ---------- Public data ----------
     const base = new URL(req.url);
-    async function loadJSON(path) {
-      try {
-        const r = await fetch(new URL(path, base.origin), { headers: { "cache-control": "no-cache" } });
-        if (!r.ok) return null;
-        return await r.json();
-      } catch { return null; }
-    }
-    const MEDIA = (await loadJSON("/data/parking_media.json")) || [];
 
     // ---------- Utils: messages ----------
     const lastUserText = () => [...messages].reverse().find(m=>m.role==='user')?.content || '';
@@ -45,11 +37,16 @@ export default async (req) => {
     // ---------- Language handling ----------
     const SUPPORTED = { cs: "Čeština", en: "English", de: "Deutsch", es: "Español" };
 
-    function getChosenLangFromHistory(msgs){
+    function detectLangFromAssistant(msgs){
+      // vezmeme jazyk poslední asistentovy „delší“ zprávy
       for (let i=msgs.length-1;i>=0;i--){
-        const c = msgs[i]?.content || "";
-        const m = /⟦lang:(cs|en|de|es)⟧/.exec(String(c));
-        if (m) return m[1];
+        const m = msgs[i];
+        if (m?.role !== 'assistant') continue;
+        const t = (m.content||'').toLowerCase();
+        if (/[ěščřžýáíéůúĚŠČŘŽÝÁÍÉŮÚ]/.test(t) || /čes|češt|bagáž|pokoj/i.test(t)) return "cs";
+        if (/\bder\b|\bund\b|straße|\bdeutsch\b/.test(t)) return "de";
+        if (/\bel \b|la |¿|¡|\bespañol|estacionamiento/.test(t)) return "es";
+        if (t) return "en";
       }
       return null;
     }
@@ -59,7 +56,6 @@ export default async (req) => {
       if (/^(en|eng|english)$/.test(t)) return "en";
       if (/^(es|esp|español|spanish)$/.test(t)) return "es";
       if (/^(de|ger|deutsch|german)$/.test(t)) return "de";
-      // tolerantní zachycení vět
       if (/(čeština|cestina|česky)/.test(t)) return "cs";
       if (/\benglish\b/.test(t)) return "en";
       if (/\bespañol|spanish\b/.test(t)) return "es";
@@ -98,7 +94,6 @@ export default async (req) => {
 
 You can also write e.g. "Pošli mi to v češtině" / "Please switch to English".`;
 
-    // Onboarding už neobsahuje žádost „sdělte datum/čas“ – ať se neptáme 2×
     function onboardingEN(){ return `
 Welcome to **CHILL Apartments**! ✨
 
@@ -112,45 +107,43 @@ The cost is **31 EUR** for up to 4 people and **42 EUR** for more than 4 (up to 
 The drive from the airport takes **about 30 minutes**.
 If you’d like this service, please tell me your **flight number** and **exact landing time**.
 
-**Self check-in**
-The key will be in a **white key box** in the passage to the courtyard, right after the gate.  
-Gate code: **3142#** (left wall).  
-If you arrive **before check-in**, store your **luggage** in the luggage room next to the key box. Code is the same (**3142#**).  
-Next to it is the **key box** for your apartment (**#1**, code **(code#)**). Inside: **one key + one chip**.  
-The chip opens the **main door** (right side of the parking area) and can open the **gate** during your stay (sensor next to the dial box).  
-To open the gate from inside, use the **white switch** next to the key box; it **closes automatically** in **2.5 minutes**.  
-Your apartment number is **(apartment number)** on the **(floor)** floor.  
-Please don’t store your key in the key box during your stay.
+**Self check-in — step by step**
+1) **Open the gate** — dial **3142#** on the left wall.  
+   ![Gate keypad](/img/gate.jpg)
+
+2) **Luggage room** (if you arrive before check-in) — next to the key box, **same code 3142#**.  
+   ![Luggage room door](/img/luggage.jpg)
+
+3) **Key box location** — the **white key box** is in the passage to the courtyard, right after the gate.  
+   ![Key box](/img/keybox.jpg)
+
+4) **Apartment key box code** — the **code will be sent by David** before arrival.  
+   *(Do not store your key in the box during your stay.)*
+
+5) **Main entrance chip** — the chip opens the **main door** on the right side of the parking area; it also opens the **gate** via the sensor next to the dial box.  
+   ![Gate sensor](/img/sensor.jpg)
+
+6) **Gate from inside** — use the **white switch** next to the key box; it **closes automatically** in **2.5 minutes**.  
+   ![Parking entry](/img/parking-entry.jpg)
+
+7) **Apartment number** — **David will send your apartment number** before arrival.
 
 **Wi-Fi & TV**
-You’ll find the Wi-Fi name & password on the **bottom of the router**.  
-The TV has **no channels**, but it’s a **Smart TV**.
+Wi-Fi name & password are on the **bottom of the router**. The TV has **no channels**, it’s a **Smart TV**.
 
 **AC**
 Mode **Sun** heats, **Snowflake** cools.
 
 **Check-out**
-Check-out is **before 11:00 a.m.**  
-Please drop the key into the **white postal box** on the ground floor, opposite the elevator (inside the building).  
-You can use the **luggage room after check-out** as well.
+Check-out is **before 11:00 a.m.** Drop the key into the **white postal box** on the ground floor, opposite the elevator (inside).
 
 **House rules**
-All rooms are **strictly non-smoking** (fine **100 EUR**).  
-Balconies on all floors + courtyard available.  
-No **open fire** in the apartment.
+All rooms are **strictly non-smoking** (fine **100 EUR**). Balconies on all floors + courtyard available. No **open fire** in the apartment.
 
-All information is also in your room (blue frame).
+_All information is also in your room (blue frame)._
+
+**To get you ready:** please send your **arrival date & time** (e.g. *28.09.2025 18:30*) and whether you **need parking** or an **airport taxi**.
 `.trim(); }
-
-    function mediaBlock() {
-      if (!Array.isArray(MEDIA) || MEDIA.length === 0) return "";
-      const lines = MEDIA.map((m, i) => {
-        const url = new URL(`/${m.src}`, base.origin).toString();
-        const caption = m.caption || `Photo ${i + 1}`;
-        return `![${caption}](${url})`;
-      });
-      return `\n\n**Photos / map / animation:**\n${lines.join("\n")}`;
-    }
 
     // ---------- Intent detection ----------
     function wantsParking(text){ return /(park|parking|parkování|garáž|garage|auto)/i.test(text||''); }
@@ -159,7 +152,8 @@ All information is also in your room (blue frame).
     function detectIntent(text){
       const t = text || '';
       const hasRange = /(\d{2})\.(\d{2})\.\s*[–-]\s*(\d{2})\.(\d{2})\.(\d{4})/.test(t);
-      if (hasRange || wantsParking(t) || saysOneNight(t)) return "parking";
+      const hasSingle = /\b(\d{2})\.(\d{2})\.(\d{4})\b/.test(t);
+      if (hasRange || hasSingle || wantsParking(t) || saysOneNight(t)) return "parking";
       if (/(wifi|wi-?fi|internet)/i.test(t)) return "wifi";
       if (wantsTaxi(t)) return "taxi";
       if (/(schod|stairs|handicap|wheelchair|invalid)/i.test(t)) return "stairs";
@@ -181,25 +175,33 @@ All information is also in your room (blue frame).
       const t = (text||'').trim();
       const re = /(^|.*?\s)\b(\d{2})\.(\d{2})\.\s*[–-]\s*(\d{2})\.(\d{2})\.(\d{4})\b/;
       const m = re.exec(t);
-      if (!m) {
-        return { confirmed:null, ask:
-          "Pro rezervaci parkování napište termín **přesně** ve tvaru:\n\n" +
-          "**DD.MM.–DD.MM.YYYY** (např. **20.09.–24.09.2025**)\n\n" +
-          'Mezi dny použijte pomlčku "-" nebo en-dash "–".'
-        };
-      }
+      if (!m) return { confirmed:null, ask:
+        "Pro rezervaci parkování napište termín **přesně** ve tvaru:\n\n**DD.MM.–DD.MM.YYYY** (např. **20.09.–24.09.2025**)\n\nMezi dny použijte pomlčku \"-\" nebo en-dash \"–\"."
+      };
       const d1=+m[2], m1=+m[3], d2=+m[4], m2=+m[5], y=+m[6];
       const a={ y, mo:m1, d: clamp(y,m1,d1) };
       const b={ y, mo:m2, d: clamp(y,m2,d2) };
       const isoA = fmtISO(a.y,a.mo,a.d);
       const isoB = fmtISO(b.y,b.mo,b.d);
       const from = isoA<=isoB ? isoA : isoB;
-      const to   = isoA<=isoB ? isoB : isoA; // den odjezdu exkl.
+      const to   = isoA<=isoB ? isoB : isoA; // departure excl.
       return { confirmed:{ from, to }, ask:null };
     }
 
+    function parseSingleDateAsOneNight(text){
+      const t = (text||'').trim();
+      // vyřadíme případy, kde už je rozsah s pomlčkou
+      if (/[–-]/.test(t)) return null;
+      const m = /\b(\d{2})\.(\d{2})\.(\d{4})\b/.exec(t);
+      if (!m) return null;
+      const d = clamp(+m[3], +m[2], +m[1]);
+      const from = fmtISO(+m[3], +m[2], d);
+      const next = new Date(from + "T00:00:00Z"); next.setUTCDate(next.getUTCDate()+1);
+      const to = toISODate(next);
+      return { from, to };
+    }
+
     function rangeFromHistory(msgs){
-      // podporujeme CZ i EN text dostupnosti (po překladu)
       const patterns = [
         /Dostupnost pro \*\*(\d{4}-\d{2}-\d{2})\s*→\s*(\d{4}-\d{2}-\d{2})\*\*/,
         /Availability for \*\*(\d{4}-\d{2}-\d{2})\s*→\s*(\d{4}-\d{2}-\d{2})\*\*/
@@ -253,34 +255,31 @@ All information is also in your room (blue frame).
 
     // ---------- Language gate ----------
     const userText = lastUserText();
-    let chosenLang = getChosenLangFromHistory(messages);
-    const requestedLang = wantsLanguage(userText);
+    let chosenLang = wantsLanguage(userText) || detectLangFromAssistant(messages);
 
-    // 1) Uživatelská volba jazyka má prioritu – přepni a pošli onboarding v JEDNÉ odpovědi
-    if (requestedLang && requestedLang !== chosenLang) {
-      chosenLang = requestedLang;
-      const onboardingTranslated = await translateTo(onboardingEN(), chosenLang);
-      const confirm = await translateTo("Language switched.", chosenLang);
-      return ok(`⟦lang:${chosenLang}⟧\n${confirm}\n\n${onboardingTranslated}`);
-    }
-
-    // 2) Je to úplně první interakce a zatím není jazyk → polož otázku na jazyk
+    // 1) Je to úplně první interakce a zatím není jazyk → polož otázku na jazyk
     if (!chosenLang && userCount === 1 && assistantCount === 0) {
       return ok(LangQuestionEN);
     }
-
-    // 3) Stále není jazyk? Zvol heuristicky a pošli onboarding
+    // 2) Stále není jazyk? Zvol heuristicky a pošli onboarding
     if (!chosenLang) {
       chosenLang = /[ěščřžýáíéůúĚŠČŘŽÝÁÍÉŮÚ]|češtin|česky|cz|cs/i.test(userText) ? "cs" : "en";
       const onboardingTranslated = await translateTo(onboardingEN(), chosenLang);
       const note = await translateTo("Okay, I will continue in this language.", chosenLang);
-      return ok(`⟦lang:${chosenLang}⟧\n${note}\n\n${onboardingTranslated}`);
+      return ok(`${note}\n\n${onboardingTranslated}`);
+    }
+    // 3) Pokud právě přišla explicitní volba jazyka → pošli onboarding rovnou
+    const explicitLang = wantsLanguage(userText);
+    if (explicitLang) {
+      chosenLang = explicitLang;
+      const onboardingTranslated = await translateTo(onboardingEN(), chosenLang);
+      return ok(onboardingTranslated);
     }
 
     // ---------- Router (all replies translated to chosenLang) ----------
     const intent = detectIntent(userText);
     const priorRange = rangeFromHistory(messages);
-    const activeParking = intent === "parking" || !!priorRange; // ← důležité: pokračujeme i bez klíčového slova
+    const activeParking = intent === "parking" || !!priorRange; // pokračujeme i bez klíčového slova
 
     // Stručná pomoc pro jiné intenty
     if (!activeParking && intent !== "unknown") {
@@ -344,11 +343,13 @@ All information is also in your room (blue frame).
     }
 
     let derived = (saysOneNight(userText) ? deriveOneNightRangeFromArrival(userText) : null);
-    let parsed  = parseDatesStrict(userText);
-    let effectiveRange = derived || parsed.confirmed || priorRange;
+    let parsedRange  = parseDatesStrict(userText);
+    let singleRange  = parseSingleDateAsOneNight(userText);
+    let effectiveRange = derived || singleRange || parsedRange.confirmed || priorRange;
 
     if (activeParking && !effectiveRange) {
-      const ask = parsed.ask || "Napište prosím termín parkování ve formátu **DD.MM.–DD.MM.YYYY**.";
+      // Už onboarding se ptal na příjezd; tady chceme jen termín parkování (když ještě není)
+      const ask = parsedRange.ask || "Napište prosím termín parkování ve formátu **DD.MM.–DD.MM.YYYY** (např. **20.09.–24.09.2025**), nebo napište **jedno datum** pro 1 noc (např. **28.09.2025**).";
       return ok(await translateTo(ask, chosenLang));
     }
 
@@ -367,7 +368,6 @@ All information is also in your room (blue frame).
           out.push({ date: iso, ok:true, total: Number(d.total_spots)||0, booked: Number(d.booked)||0, free: Math.max(0, Number(d.free)||0), note: String(d.note||"") });
         }
       }
-      const lines   = out.map(d => d.ok ? `• ${d.date}: volno ${d.free} / ${d.total}${d.note ? ` (${d.note})` : ""}` : `• ${d.date}: dostupnost neznámá${d.note ? ` (${d.note})` : ""}`);
       const allKnown= out.every(d=>d.ok);
       const allFree = allKnown && out.every(d=>d.free>0);
       const anyFull = out.some(d=>d.ok && d.free<=0);
@@ -376,7 +376,7 @@ All information is also in your room (blue frame).
 `Availability for **${from} → ${to}** (nights: ${out.length}, departure day not counted)
 ${out.map(d => d.ok ? `• ${d.date}: free ${d.free} / ${d.total}${d.note ? ` (${d.note})` : ""}` : `• ${d.date}: availability unknown${d.note ? ` (${d.note})` : ""}`).join("\n")}
 ${allFree
-  ? "\nAll nights are available. Please send the guest name, license plate and arrival time (HH:mm)."
+  ? "\nAll nights are available. Please send the guest name and license plate. Arrival time (HH:mm) is optional."
   : anyFull
     ? "\nSome nights are full. We can look for another date or suggest alternatives (mrparkit.com)."
     : "\nSome days are unknown; availability needs manual confirmation."}`;
@@ -390,11 +390,9 @@ ${allFree
       const need = [];
       if (!details?.guest_name) need.push(chosenLang==='cs' ? "jméno hosta" : "guest name");
       if (!details?.car_plate) need.push(chosenLang==='cs' ? "SPZ" : "license plate");
-      // arrival_time je volitelný → když chybí, nevadí (zapíšeme bez něj)
       if (!need.length) return null;
       const example = chosenLang==='cs' ? "Jan Novák, 7AZ 1234, 18:30" : "John Smith, ABC1234, 18:30";
-      const base = `Please provide: ${need.join(", ")}.\nYou can write it in one message, e.g.: **${example}**.`;
-      return base;
+      return `Please provide: ${need.join(", ")}.\nYou can write it in one message, e.g.: **${example}**.`;
     }
 
     if (activeParking && AV) {
@@ -427,7 +425,7 @@ ${allFree
       }
       if (!failed){
         const list = AV.days.map(d=>`• ${d.date}`).join("\n");
-        const packEN = `
+        const packCS = `
 **Parkování a příjezd**
 - Parkování je **20 € / noc**.
 - Rezervované parkování je k dispozici od **12:00** v den příjezdu.
@@ -441,9 +439,13 @@ ${allFree
 **Úschova zavazadel**
 - **Před 14:00** — uložte zavazadla do **bagážovny**.
 - **Po check-outu (11:00)** — bagážovna je k dispozici.
-${mediaBlock()}`.trim();
+![Gate keypad](/img/gate.jpg)
+![Key box](/img/keybox.jpg)
+![Luggage room door](/img/luggage.jpg)
+![Gate sensor](/img/sensor.jpg)
+![Parking entry](/img/parking-entry.jpg)`.trim();
 
-        const instr = await translateTo(packEN, chosenLang);
+        const instr = await translateTo(packCS, chosenLang);
         const confirmEN =
 `✅ Parking reservation saved (${AV.nights} night${AV.nights>1?'s':''}):
 ${list}
