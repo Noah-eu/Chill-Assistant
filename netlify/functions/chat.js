@@ -1,11 +1,10 @@
 // netlify/functions/chat.js
 
 const TRANSLATE_INSTRUCTIONS = true;
-const VERSION = "chatjs-2025-09-24-langflow-v3";
 
 export default async (req) => {
   const ok = (reply) =>
-    new Response(JSON.stringify({ reply: reply + `\n\n— ${VERSION}` }), {
+    new Response(JSON.stringify({ reply }), {
       status: 200,
       headers: { "content-type": "application/json" },
     });
@@ -41,6 +40,7 @@ export default async (req) => {
     // ---------- Utils: messages ----------
     const lastUserText = () => [...messages].reverse().find(m=>m.role==='user')?.content || '';
     const userCount = messages.filter(m=>m.role==='user').length;
+    const assistantCount = messages.filter(m=>m.role==='assistant').length;
 
     // ---------- Language handling ----------
     const SUPPORTED = { cs: "Čeština", en: "English", de: "Deutsch", es: "Español" };
@@ -52,9 +52,6 @@ export default async (req) => {
         if (m) return m[1];
       }
       return null;
-    }
-    function hasAskedLang(msgs){
-      return msgs.some(m => /⟦asklang⟧/.test(String(m?.content || "")));
     }
     function wantsLanguage(text){
       const t = (text||"").trim().toLowerCase();
@@ -101,11 +98,9 @@ export default async (req) => {
 
 You can also write e.g. "Pošli mi to v češtině" / "Please switch to English".`;
 
-    function onboardingPreambleEN(){ return `
+    // Onboarding už neobsahuje žádost „sdělte datum/čas“ – ať se neptáme 2×
+    function onboardingEN(){ return `
 Welcome to **CHILL Apartments**! ✨
-
-Please tell me your **arrival date & time** (e.g. 28.09.2025 18:30),
-whether you **need parking**, and if you want an **airport taxi**.
 
 **Check-in** is from **2:00 p.m.**.
 
@@ -116,9 +111,7 @@ I can also arrange an airport pick-up.
 The cost is **31 EUR** for up to 4 people and **42 EUR** for more than 4 (up to 8), or if your luggage won’t fit into a sedan.
 The drive from the airport takes **about 30 minutes**.
 If you’d like this service, please tell me your **flight number** and **exact landing time**.
-`.trim(); }
 
-    function fullInstructionsEN(){ return `
 **Self check-in**
 The key will be in a **white key box** in the passage to the courtyard, right after the gate.  
 Gate code: **3142#** (left wall).  
@@ -148,10 +141,6 @@ No **open fire** in the apartment.
 
 All information is also in your room (blue frame).
 `.trim(); }
-
-    function onboardingBundleEN(){ return `${onboardingPreambleEN()}
-
-${fullInstructionsEN()}`; }
 
     function mediaBlock() {
       if (!Array.isArray(MEDIA) || MEDIA.length === 0) return "";
@@ -210,11 +199,17 @@ ${fullInstructionsEN()}`; }
     }
 
     function rangeFromHistory(msgs){
+      // podporujeme CZ i EN text dostupnosti (po překladu)
+      const patterns = [
+        /Dostupnost pro \*\*(\d{4}-\d{2}-\d{2})\s*→\s*(\d{4}-\d{2}-\d{2})\*\*/,
+        /Availability for \*\*(\d{4}-\d{2}-\d{2})\s*→\s*(\d{4}-\d{2}-\d{2})\*\*/
+      ];
       for (let i=msgs.length-1;i>=0;i--){
-        const m = msgs[i];
-        if (!m || !m.content) continue;
-        const mm = /Dostupnost pro \*\*(\d{4}-\d{2}-\d{2})\s*→\s*(\d{4}-\d{2}-\d2)\*\*/.exec(String(m.content));
-        if (mm) return { from:mm[1], to:mm[2] };
+        const c = String(msgs[i]?.content || "");
+        for (const re of patterns){
+          const mm = re.exec(c);
+          if (mm) return { from:mm[1], to:mm[2] };
+        }
       }
       return null;
     }
@@ -256,48 +251,43 @@ ${fullInstructionsEN()}`; }
       } catch(e){ return { ok:false, error:String(e) }; }
     }
 
-    // ---------- Onboarding (EN source) ----------
-    function onboardingForLang(){ return onboardingBundleEN(); }
-
     // ---------- Language gate ----------
     const userText = lastUserText();
     let chosenLang = getChosenLangFromHistory(messages);
     const requestedLang = wantsLanguage(userText);
-    const askedBefore = hasAskedLang(messages);
 
-    // 1) Pokud uživatel jasně napsal jazyk → PŘEPNI HNED + pošli onboarding (v jedné odpovědi)
+    // 1) Uživatelská volba jazyka má prioritu – přepni a pošli onboarding v JEDNÉ odpovědi
     if (requestedLang && requestedLang !== chosenLang) {
       chosenLang = requestedLang;
-      const bundleEN = onboardingForLang();
-      const onboardingTranslated = await translateTo(bundleEN, chosenLang);
+      const onboardingTranslated = await translateTo(onboardingEN(), chosenLang);
       const confirm = await translateTo("Language switched.", chosenLang);
       return ok(`⟦lang:${chosenLang}⟧\n${confirm}\n\n${onboardingTranslated}`);
     }
 
-    // 2) Není zvolen jazyk a ještě jsme se neptali → pošli JEDNOU dotaz (s markerem)
-    if (!chosenLang && !askedBefore) {
-      return ok(`⟦asklang⟧\n${LangQuestionEN}`);
+    // 2) Je to úplně první interakce a zatím není jazyk → polož otázku na jazyk
+    if (!chosenLang && userCount === 1 && assistantCount === 0) {
+      return ok(LangQuestionEN);
     }
 
-    // 3) Po dotazu uživatel odpověděl něčím nejasným → nastav heuristicky a pošli onboarding
-    if (!chosenLang && askedBefore) {
-      const guess = /[ěščřžýáíéůúĚŠČŘŽÝÁÍÉŮÚ]|češtin|česky|cz|cs/i.test(userText) ? "cs" : "en";
-      const bundleEN = onboardingForLang();
-      const onboardingTranslated = await translateTo(bundleEN, guess);
-      const note = await translateTo("Okay, I will continue in this language.", guess);
-      return ok(`⟦lang:${guess}⟧\n${note}\n\n${onboardingTranslated}`);
+    // 3) Stále není jazyk? Zvol heuristicky a pošli onboarding
+    if (!chosenLang) {
+      chosenLang = /[ěščřžýáíéůúĚŠČŘŽÝÁÍÉŮÚ]|češtin|česky|cz|cs/i.test(userText) ? "cs" : "en";
+      const onboardingTranslated = await translateTo(onboardingEN(), chosenLang);
+      const note = await translateTo("Okay, I will continue in this language.", chosenLang);
+      return ok(`⟦lang:${chosenLang}⟧\n${note}\n\n${onboardingTranslated}`);
     }
 
     // ---------- Router (all replies translated to chosenLang) ----------
     const intent = detectIntent(userText);
+    const priorRange = rangeFromHistory(messages);
+    const activeParking = intent === "parking" || !!priorRange; // ← důležité: pokračujeme i bez klíčového slova
 
-    // Non-parking short helper
-    if (intent !== "parking" && intent !== "unknown") {
+    // Stručná pomoc pro jiné intenty
+    if (!activeParking && intent !== "unknown") {
       return ok(await translateTo("How can I help you further? (Wi-Fi, taxi, parking, AC, power…)", chosenLang));
     }
 
     // ---------- PARKING FLOW ----------
-    // ... (zbytek je stejný jako v tvé verzi v2, vše proháníme přes translateTo(..., chosenLang))
     function extractArrivalDateTime(text) {
       const t = (text || "").trim();
       const reDT = /\b(\d{2})\.(\d{2})\.(\d{4})(?:[ T]+(\d{1,2})[:.](\d{2}))?\b/;
@@ -355,15 +345,15 @@ ${fullInstructionsEN()}`; }
 
     let derived = (saysOneNight(userText) ? deriveOneNightRangeFromArrival(userText) : null);
     let parsed  = parseDatesStrict(userText);
-    let effectiveRange = derived || parsed.confirmed || rangeFromHistory(messages);
+    let effectiveRange = derived || parsed.confirmed || priorRange;
 
-    if (intent === "parking" && !effectiveRange) {
+    if (activeParking && !effectiveRange) {
       const ask = parsed.ask || "Napište prosím termín parkování ve formátu **DD.MM.–DD.MM.YYYY**.";
       return ok(await translateTo(ask, chosenLang));
     }
 
     let AV = null;
-    if (intent === "parking" && effectiveRange) {
+    if (activeParking && effectiveRange) {
       const { from, to } = effectiveRange;
       const out = [];
       const start = new Date(from + "T00:00:00Z");
@@ -377,21 +367,22 @@ ${fullInstructionsEN()}`; }
           out.push({ date: iso, ok:true, total: Number(d.total_spots)||0, booked: Number(d.booked)||0, free: Math.max(0, Number(d.free)||0), note: String(d.note||"") });
         }
       }
-      const lines   = out.map(d => d.ok ? `• ${d.date}: free ${d.free} / ${d.total}${d.note ? ` (${d.note})` : ""}` : `• ${d.date}: availability unknown${d.note ? ` (${d.note})` : ""}`);
+      const lines   = out.map(d => d.ok ? `• ${d.date}: volno ${d.free} / ${d.total}${d.note ? ` (${d.note})` : ""}` : `• ${d.date}: dostupnost neznámá${d.note ? ` (${d.note})` : ""}`);
       const allKnown= out.every(d=>d.ok);
       const allFree = allKnown && out.every(d=>d.free>0);
       const anyFull = out.some(d=>d.ok && d.free<=0);
 
-      const baseText =
+      const baseTextEN =
 `Availability for **${from} → ${to}** (nights: ${out.length}, departure day not counted)
-${lines.join("\n")}
+${out.map(d => d.ok ? `• ${d.date}: free ${d.free} / ${d.total}${d.note ? ` (${d.note})` : ""}` : `• ${d.date}: availability unknown${d.note ? ` (${d.note})` : ""}`).join("\n")}
 ${allFree
   ? "\nAll nights are available. Please send the guest name, license plate and arrival time (HH:mm)."
   : anyFull
     ? "\nSome nights are full. We can look for another date or suggest alternatives (mrparkit.com)."
     : "\nSome days are unknown; availability needs manual confirmation."}`;
 
-      AV = { from, to, nights: out.length, days: out, allKnown, allFree, anyFull, text: await translateTo(baseText, chosenLang) };
+      const baseText = await translateTo(baseTextEN, chosenLang);
+      AV = { from, to, nights: out.length, days: out, allKnown, allFree, anyFull, text: baseText };
     }
 
     const details = extractDetailsFromFreeText();
@@ -399,28 +390,30 @@ ${allFree
       const need = [];
       if (!details?.guest_name) need.push(chosenLang==='cs' ? "jméno hosta" : "guest name");
       if (!details?.car_plate) need.push(chosenLang==='cs' ? "SPZ" : "license plate");
-      if (!details?.arrival_time) need.push(chosenLang==='cs' ? "čas příjezdu (HH:mm)" : "arrival time (HH:mm)");
+      // arrival_time je volitelný → když chybí, nevadí (zapíšeme bez něj)
       if (!need.length) return null;
       const example = chosenLang==='cs' ? "Jan Novák, 7AZ 1234, 18:30" : "John Smith, ABC1234, 18:30";
       const base = `Please provide: ${need.join(", ")}.\nYou can write it in one message, e.g.: **${example}**.`;
       return base;
     }
 
-    if (intent === "parking" && AV) {
+    if (activeParking && AV) {
       const need = missingDetailsPrompt(details);
       if (need) {
         return ok(`${AV.text}\n\n${await translateTo(need, chosenLang)}`);
       }
     }
 
-    if (intent === "parking" && AV && AV.allKnown && AV.nights>0 && details && details.guest_name && details.car_plate) {
+    if (activeParking && AV && AV.allKnown && AV.nights>0 && details && details.guest_name && details.car_plate) {
       const who = `${details.guest_name} / ${details.car_plate}`.trim();
       const bookedDates = []; let failed=null;
 
+      // re-check
       for (const d of AV.days){
         const check = await gsGetParking(d.date);
         if (!check?.ok || (Number(check.free)||0) <= 0){ failed = { date:d.date, reason:'No free spot' }; break; }
       }
+      // book
       if (!failed){
         for (const d of AV.days){
           const res = await gsPostBook(d.date, who, details.arrival_time || '');
@@ -428,30 +421,31 @@ ${allFree
           bookedDates.push(d.date);
         }
       }
+      // rollback
       if (failed && bookedDates.length){
         for (const date of bookedDates.reverse()){ await gsPostCancel(date, who).catch(()=>{}); }
       }
       if (!failed){
         const list = AV.days.map(d=>`• ${d.date}`).join("\n");
         const packEN = `
-**Parking & arrival**
-- Parking is **20 € / night**.
-- Reserved parking is available from **12:00** on arrival day.
-- Room **check-out is by 11:00**. Keeping the car after 11:00 is **subject to availability** — message us to confirm.
-- The passage is **narrow (width 220 cm)**, **height is unlimited** — tall cars fit.
-- If the lot is full and you just need to unload: you can stop for ~**10 minutes** on the sidewalk in front of the house (between our and the next gate).
+**Parkování a příjezd**
+- Parkování je **20 € / noc**.
+- Rezervované parkování je k dispozici od **12:00** v den příjezdu.
+- **Check-out z pokoje do 11:00**. Ponechání auta po 11:00 je **jen dle dostupnosti** – napište, potvrdíme.
+- Průjezd je **úzký (šířka 220 cm)**, **výška neomezená** – projede i vysoké auto.
+- Když je parkoviště plné a potřebujete jen vyložit: můžete zastavit ~**10 minut** na chodníku před domem (mezi naším a vedlejším vjezdem).
 
 **Self check-in**
-- **Access code and apartment number will be sent by David** before arrival.
+- Kód do boxu a **číslo apartmánu pošle David** před příjezdem.
 
-**Luggage storage**
-- **Before 14:00** — store luggage in the **luggage room**.
-- **After check-out (11:00)** — luggage room is available as well.
+**Úschova zavazadel**
+- **Před 14:00** — uložte zavazadla do **bagážovny**.
+- **Po check-outu (11:00)** — bagážovna je k dispozici.
 ${mediaBlock()}`.trim();
 
         const instr = await translateTo(packEN, chosenLang);
         const confirmEN =
-`✅ Reservation saved (${AV.nights} nights):
+`✅ Parking reservation saved (${AV.nights} night${AV.nights>1?'s':''}):
 ${list}
 Guest: ${details.guest_name}, Plate: ${details.car_plate}, Arrival: ${details.arrival_time || 'n/a'}
 
@@ -463,7 +457,7 @@ ${instr}`;
       }
     }
 
-    if (intent === "parking" && AV) {
+    if (activeParking && AV) {
       return ok(AV.text);
     }
 
