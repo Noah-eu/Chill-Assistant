@@ -114,13 +114,12 @@ If you’d like this service, please tell me your **flight number** and **exact 
    ![Luggage room door](${IMG('/img/luggage.jpg')})
 
 3) **Key box location** — the **white key box** is in the passage to the courtyard, right after the gate.  
-   ![Key box location](${IMG('/img/keybox.jpg')})
+   ![Key box](${IMG('/img/keybox.jpg')})
 
-4) **Apartment key box code** — the **code will be sent by David** before arrival.  
+4) **Apartment key box code** — **David will send the code** before arrival.  
    *(Do not store your key in the box during your stay.)*
-   ![Self check-out/key drop box](${IMG('/img/12. Box_self-check-out.jpg')})
 
-5) **Main entrance chip** — the chip opens the **main door** on the right side of the parking area; it also opens the **gate** via the sensor next to the dial box.  
+5) **Main entrance chip** — the chip opens the **main door** on the right side of the parking area; it also opens the **gate** via the sensor next to the dial pad.  
    ![Main entrance](${IMG('/img/11. Main-entrance.jpg')})
    ![Gate sensor](${IMG('/img/sensor.jpg')})
 
@@ -129,17 +128,17 @@ If you’d like this service, please tell me your **flight number** and **exact 
 
 7) **Apartment number** — **David will send your apartment number** before arrival.
 
-**Wi-Fi & TV**
+**Wi-Fi & TV**  
 Wi-Fi name & password are on the **bottom of the router**. The TV has **no channels**, it’s a **Smart TV**.
 
-**AC**
+**AC**  
 Mode **Sun** heats, **Snowflake** cools.
 
-**Check-out**
+**Check-out**  
 Check-out is **before 11:00 a.m.** Drop the key into the **white postal box** on the ground floor, opposite the elevator (inside).  
 ![Self check-out/key drop box](${IMG('/img/12. Box_self-check-out.jpg')})
 
-**House rules**
+**House rules**  
 All rooms are **strictly non-smoking** (fine **100 EUR**). Balconies on all floors + courtyard available. No **open fire** in the apartment.
 
 _All information is also in your room (blue frame)._
@@ -324,7 +323,7 @@ _All information is also in your room (blue frame)._
       const t = lastUserText().trim();
       if (!t) return null;
       const timeMatch = t.match(/(\b\d{1,2}[:.]\d{2}\b)/);
-      const arrival = timeMatch ? timeMatch[1].replace(".", ":") : null;
+      const arrival = timeMatch ? t.match(/(\b\d{1,2}[:.]\d{2}\b)/)[0].replace(".", ":") : null;
       const parts = t.split(/[,;\n]/).map((s) => s.trim()).filter(Boolean);
 
       // tolerantní SPZ: povolí mezery a pomlčky, normalizuje na bez mezer
@@ -438,11 +437,12 @@ ${allFree
 - Když je parkoviště plné a potřebujete jen vyložit: můžete zastavit ~**10 minut** na chodníku před domem (mezi naším a vedlejším vjezdem).
 
 **Self check-in**
-- Kód do boxu a **číslo apartmánu pošle David** před příjezdem.
+- **Kód do boxu a číslo apartmánu pošle David** před příjezdem.
 
 **Úschova zavazadel**
 - **Před 14:00** — uložte zavazadla do **bagážovny**.
 - **Po check-outu (11:00)** — bagážovna je k dispozici.
+
 ![Gate keypad](${IMG('/img/gate.jpg')})
 ![Key box](${IMG('/img/keybox.jpg')})
 ![Luggage room door](${IMG('/img/luggage.jpg')})
