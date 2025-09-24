@@ -31,7 +31,7 @@ export default async (req) => {
     if (!PARKING_API_URL)
       return userErr('Server: chybí PARKING_API_URL. Nastav v Netlify (Production) na URL Apps Script WebApp (končící na /exec).');
 
-    // ---------- Public data (statické JSON z /data) ----------
+    // ---------- Public data ----------
     const base = new URL(req.url);
     async function loadJSON(path) {
       try {
@@ -42,6 +42,16 @@ export default async (req) => {
     }
     const HOTEL = (await loadJSON("/data/hotel.json")) || {};
     const MEDIA = (await loadJSON("/data/parking_media.json")) || [];
+
+    // ---------- Heuristika jazyka ----------
+    function userSeemsCzech(text) {
+      const t = (text || "").toLowerCase();
+      return /[ěščřžýáíéúůďťň]/.test(t) ||
+             /(ahoj|dobrý|dobry|prosím|prosim|děkuji|dekuji|příjezd|prijezd|parkování|parkovani|letiště|letiste)/.test(t);
+    }
+    function lastUserTextOf(msgs){
+      return [...msgs].reverse().find(m=>m.role==='user')?.content || '';
+    }
 
     // ---------- Překladač ----------
     async function callOpenAI(msgs) {
@@ -64,8 +74,10 @@ export default async (req) => {
       } catch { return `Translator bad json: ${txt}`; }
     }
     async function translateIfNeeded(text, userMsgs) {
-      if (!TRANSLATE_INSTRUCTIONS) return text;
-      const sample = ([...userMsgs].reverse().find((m) => m.role === "user")?.content || "").slice(0, 500);
+      // nepřekládej, pokud to vypadá na češtinu
+      const sample = lastUserTextOf(userMsgs);
+      if (!TRANSLATE_INSTRUCTIONS || userSeemsCzech(sample)) return text;
+
       const msgs = [
         { role: "system", content: "You are a precise translator. Keep meaning and formatting. If source equals target language, return as is." },
         { role: "user", content: `User language sample:\n---\n${sample}\n---\nTranslate:\n${text}` },
@@ -148,11 +160,11 @@ export default async (req) => {
       return null;
     }
 
-    // ---------- Onboarding extrakce (datum/čas příjezdu, parking, taxi) ----------
+    // ---------- Onboarding extrakce ----------
     function extractArrivalDateTime(text) {
       const t = (text || "").trim();
 
-      // 1) Datum + čas: "DD.MM.YYYY HH:mm" nebo "DD.MM.YYYY H:mm"
+      // "DD.MM.YYYY HH:mm" nebo bez času
       const reDT = /\b(\d{2})\.(\d{2})\.(\d{4})(?:[ T]+(\d{1,2})[:.](\d{2}))?\b/;
       const m = reDT.exec(t);
       let dateISO = null, timeHHMM = null;
@@ -166,7 +178,7 @@ export default async (req) => {
         }
       }
 
-      // 2) Samostatný čas: "HH:mm" nebo "H.mm"
+      // samostatný čas
       if (!timeHHMM) {
         const timeOnly = /(^|\s)(\d{1,2})[:.](\d{2})(\s|$)/.exec(t);
         if (timeOnly) {
@@ -175,17 +187,13 @@ export default async (req) => {
           timeHHMM = `${hh}:${mm}`;
         }
       }
-
       return { arrival_date: dateISO, arrival_time: timeHHMM };
     }
-    function wantsParking(text) {
-      return /(park|parking|parkování|garáž|garage|auto)/i.test(text || "");
-    }
-    function wantsTaxi(text) {
-      return /(taxi|airport|letiště|pick ?up|transfer)/i.test(text || "");
-    }
+    function wantsParking(text) { return /(park|parking|parkování|garáž|garage|auto)/i.test(text || ""); }
+    function wantsTaxi(text)    { return /(taxi|airport|letiště|pick ?up|transfer)/i.test(text || ""); }
+    function saysOneNight(text) { return /(1\s*noc|jednu\s*noc|one\s*night)/i.test(text || ""); }
 
-    // ---------- Intenty (router) ----------
+    // ---------- Intenty ----------
     function detectIntent(text) {
       const t = (text || "");
       const hasParkingRange = /(\d{2})\.(\d{2})\.\s*[–-]\s*(\d{2})\.(\d{2})\.(\d{4})/.test(t);
@@ -200,10 +208,10 @@ export default async (req) => {
       if (/(balkon|balcony)/i.test(t)) return "balcony";
       if (/(pes|dog|pet|zvíř|animals)/i.test(t)) return "pets";
       if (/(check[- ]?in|check[- ]?out|arrival|příjezd|odjezd|welcome|instructions?)/i.test(t)) return "checkin";
-      return "onboarding"; // default – první kontakt
+      return "onboarding";
     }
 
-    // ---------- Sekce (CZ) pro ne-parkovací odpovědi ----------
+    // ---------- Sekce (CZ) ----------
     const SECTIONS_CZ = {
       wifi: `
 **Wi-Fi (SSID / heslo)**
@@ -228,12 +236,12 @@ Pokud Wi-Fi nefunguje: zkontrolujte kabely a zkuste **restart** (vytáhnout nap�
 `.trim(),
       taxi: `
 **Taxi (letiště)**
-Pro objednání potřebujeme: **číslo letu**, **čas příletu**, **telefon**, **počet osob a kufrů**, a zda **stačí sedan** nebo je potřeba **větší vůz**.
-Na cestu **z hotelu na letiště**: uveďte **čas vyzvednutí u hotelu**.
-**Ráno 8–9** a **15–17** mohou být **zácpy** (počítejte až **60 min**).
+Potřebujeme: **číslo letu**, **čas příletu**, **telefon**, **počet osob a kufrů**, a zda stačí **sedan** nebo je potřeba **větší vůz**.
+Z hotelu na letiště: napište **čas vyzvednutí u hotelu**.
+Špička **8–9** a **15–17** (počítejte až **60 min**).
 **Dětské sedačky** máme – napište **věk dítěte**.
 
-Potvrzení k odeslání hostovi:
+Potvrzení:
 “I arranged the pick-up for you. The driver will be waiting in the arrival hall with your name on a sign. In case you can’t find each other, please call +420 722 705 919. The price is 31 EUR / 750 CZK (cash or card to the driver).”
 (Pro 5–8 osob / hodně zavazadel: **42 EUR / 1000 CZK**.)
 `.trim(),
@@ -241,40 +249,38 @@ Potvrzení k odeslání hostovi:
 **Bezbariérovost / schody**
 - Do budovy jsou **2 schody**, do apartmánu **001** v přízemí je **1 schod**.
 - Jinak bez schodů a s **velkým výtahem**.
-- Sprchové kouty mají **cca 30 cm** práh vaničky.
+- Sprchové kouty mají **~30 cm** práh vaničky.
 `.trim(),
       ac: `
 **AC (klimatizace)**
 - Režim **Sun = topení**, **Snowflake = chlazení**.
-- Pokud **bliká zelená** na AC, je potřeba **restart**: na **balkonu 2. patra** jsou vypínače AC – **vypnout ~30 s, pak zapnout**.
+- **Bliká zelená?** Restart: na **balkonu 2. patra** vypínače AC – **vypnout ~30 s, pak zapnout**.
 `.trim(),
       power: `
 **Elektřina – jističe**
-- Nejdřív zkontrolujte **jističe v apartmánu** (malá bílá dvířka ve zdi).
-- Pokud je problém dál, u balkonu jsou **hlavní troj-jističe**; spadlý bude jako **jediný dole**.
+- Zkontrolujte **jističe v apartmánu** (malá bílá dvířka ve zdi).
+- Hlavní troj-jističe u balkonu; spadlý bude jako **jediný dole**.
 `.trim(),
       luggage: `
 **Úschovna zavazadel**
-- **Příjezd před 14:00** – můžete uložit zavazadla do **bagážovny**.
-- **Po check-outu (11:00)** – můžete uložit věci v **bagážovně**.
+- **Příjezd před 14:00** – uložte zavazadla do **bagážovny**.
+- **Po check-outu (11:00)** – lze uložit v **bagážovně**.
 `.trim(),
       balcony: `
 **Číslování a balkony**
-- První číslo apartmánu = **patro** (001 přízemí, 101 1. patro, …).
-- **Balkony** mají: **105, 205, 305**. Ostatní mohou využít **společné balkony** u výtahu na každém patře.
+- První číslo = **patro** (001 přízemí, 101 1. patro, …).
+- Balkony: **105, 205, 305**. Ostatní: **společné balkony** u výtahu.
 `.trim(),
       pets: `
 **Zvířata**
-- **Psi jsou vítáni a zdarma**, jen prosíme **ne na postele/gauče**.
+- **Psi vítáni a zdarma**, jen prosíme **ne na postele/gauče**.
 `.trim(),
       checkin: `
-**Self check-in / klíče**
+**Self check-in**
 - Kód do boxu a **číslo apartmánu pošle David** před příjezdem.
-- (Náhradní klíče jsou v bagážovně – pošleme jen pokud nastane problém.)
 `.trim(),
     };
 
-    // ---------- Média blok ----------
     function mediaBlock() {
       if (!Array.isArray(MEDIA) || MEDIA.length === 0) return "";
       const lines = MEDIA.map((m, i) => {
@@ -286,78 +292,86 @@ Potvrzení k odeslání hostovi:
     }
 
     // ---------- LOGIKA ----------
-    const lastUserText = [...messages].reverse().find((m) => m.role === "user")?.content || "";
-    const intent = detectIntent(lastUserText);
+    const lastUser = lastUserTextOf(messages);
+    const intent = detectIntent(lastUser);
 
-    // === 1) ONBOARDING (výchozí) ===
+    // === 1) ONBOARDING ===
     if (intent === "onboarding") {
-      const { arrival_date, arrival_time } = extractArrivalDateTime(lastUserText);
-      const wantPark = wantsParking(lastUserText);
-      const wantTaxi = wantsTaxi(lastUserText);
+      const { arrival_date, arrival_time } = extractArrivalDateTime(lastUser);
+      const wantPark = wantsParking(lastUser);
+      const wantTaxi = wantsTaxi(lastUser);
+      const oneNight = saysOneNight(lastUser);
 
       // Co chybí?
       const missing = [];
       if (!arrival_date) missing.push("**datum příjezdu (DD.MM.YYYY)**");
       if (!arrival_time) missing.push("**čas příjezdu (HH:mm)**");
 
-      // Když chybí datum/čas → cílená výzva
       if (missing.length) {
-        const baseText = [
+        const block = [
           "Abych připravil vše na váš příjezd, napište prosím:",
           `- ${missing.join(" a ")}`,
           "- zda potřebujete **parkování**",
           "- zda chcete **taxi** z/na letiště",
           "",
-          "**Self check-in**",
-          "- Kód do boxu a **číslo apartmánu pošle David** před příjezdem.",
+          SECTIONS_CZ.checkin,
           "",
-          "**Úschova zavazadel**",
-          "- **Příjezd před 14:00** – můžete uložit zavazadla do **bagážovny**.",
-          "- **Po check-outu (11:00)** – můžete uložit věci v **bagážovně**.",
+          SECTIONS_CZ.luggage,
           "",
           "_Fotky příjezdu/parkování doplníme později._",
         ].join("\n");
-        const reply = await translateIfNeeded(baseText, messages);
+        const reply = await translateIfNeeded(block, messages);
         return ok(reply);
       }
 
-      // Máme datum i čas → pošli shrnutí + další instrukce
-      const block = `
-**Děkuji! Zapsal jsem si příjezd:** ${arrival_date} ${arrival_time}
+      // Máme datum i čas → shrnutí + nadhození parkování/taxi
+      let extra = "";
+      if (wantPark) {
+        // pokud host píše "jen jednu noc", nabídneme/odvodíme rozsah automaticky
+        if (oneNight && arrival_date) {
+          const start = new Date(arrival_date + "T00:00:00Z");
+          const next = new Date(start); next.setUTCDate(next.getUTCDate() + 1);
+          const from = arrival_date;
+          const to = toISODate(next);
+          extra += `\nChápeme **1 noc** – zkusím zkontrolovat parkování pro **${from} → ${to}**. Napište SPZ a potvrdím.\n`;
+          // vložíme do zpráv syntetický dotaz na dostupnost (aby navazující logika fungovala bez dalšího psaní)
+          messages.push({ role: "user", content: `Parkování: ${from.replaceAll('-', '.')}–${to.replaceAll('-', '.')} ` });
+        } else {
+          extra += `\nMáte zájem o **parkování**? Napište prosím termín ve tvaru **DD.MM.–DD.MM.YYYY**.`;
+        }
+      } else {
+        extra += `\nPotřebujete **parkování**? Napište prosím termín ve tvaru **DD.MM.–DD.MM.YYYY**.`;
+      }
 
-**Self check-in**
-- Kód do boxu a **číslo apartmánu pošle David** před příjezdem.
+      if (wantTaxi) {
+        extra += `\nU **taxi** prosím pošlete **číslo letu**, **čas příletu**, **telefon**, **počet osob a kufrů**.`;
+      } else {
+        extra += `\nChcete **taxi**? Stačí **číslo letu**, **čas příletu**, **telefon**, **počet osob a kufrů**.`;
+      }
 
-**Úschova zavazadel**
-- **Příjezd před 14:00** – můžete uložit zavazadla do **bagážovny**.
-- **Po check-outu (11:00)** – můžete uložit věci v **bagážovně**.
+      const block = (
+`**Děkuji! Zapsal jsem si příjezd:** ${arrival_date} ${arrival_time}
 
-${
-  wantPark
-    ? "\nPokud chcete **parkování**, napište prosím termín ve tvaru **DD.MM.–DD.MM.YYYY** (den odjezdu je bez noci)."
-    : "Máte zájem o **parkování**? Napište, prosím, termín ve tvaru **DD.MM.–DD.MM.YYYY**."
-}
-${
-  wantTaxi
-    ? "\nU **taxi** prosím pošlete **číslo letu**, **čas příletu**, **telefon**, **počet osob a kufrů**."
-    : "Chcete **taxi**? Stačí **číslo letu**, **čas příletu**, **telefon**, **počet osob a kufrů**."
-}
+${SECTIONS_CZ.checkin}
+
+${SECTIONS_CZ.luggage}
 ${mediaBlock()}
-`.trim();
+
+${extra}`.trim());
 
       const reply = await translateIfNeeded(block, messages);
       return ok(reply);
     }
 
-    // === 2) NE-PARKOVACÍ KRÁTKÉ SEKCE ===
+    // === 2) NE-PARKOVACÍ SEKCE ===
     if (intent && !["parking","onboarding"].includes(intent)) {
       const cz = SECTIONS_CZ[intent] || "Mohu poradit s ubytováním, Wi-Fi, taxi nebo parkováním. Zeptejte se prosím konkrétněji 🙂";
       const reply = await translateIfNeeded(cz, messages);
       return ok(reply);
     }
 
-    // === 3) PARKING FLOW (jen když je to o parkování) ===
-    let parsed = parseDatesStrict(lastUserText);
+    // === 3) PARKING FLOW ===
+    let parsed = parseDatesStrict(lastUser);
     let effectiveRange = parsed.confirmed || rangeFromHistory(messages);
 
     // načíst dostupnost pro každou NOC (from..to-1)
@@ -397,9 +411,9 @@ ${allFree
       };
     }
 
-    // extrahovat detaily (jméno/SPZ/čas) – pro rychlý zápis
+    // extrakce detailů (jméno/SPZ/čas) pro rychlý zápis
     function extractDetails(msgs) {
-      const t = ([...msgs].reverse().find((m) => m.role === "user")?.content || "").trim();
+      const t = lastUserTextOf(msgs).trim();
       if (!t) return null;
       const timeMatch = t.match(/(\b\d{1,2}[:.]\d{2}\b)/);
       const arrival = timeMatch ? timeMatch[1].replace(".", ":") : null;
@@ -427,13 +441,13 @@ ${allFree
       const bookedDates = [];
       let failed = null;
 
-      // 1) re-check volno (race condition)
+      // re-check volno
       for (const d of AVAILABILITY.days) {
         const check = await gsGetParking(d.date);
         if (!check?.ok || (Number(check.free) || 0) <= 0) { failed = { date: d.date, reason: "No free spot" }; break; }
       }
 
-      // 2) book po dnech
+      // book po dnech
       if (!failed) {
         for (const d of AVAILABILITY.days) {
           const res = await gsPostBook(d.date, who, details.arrival_time || "");
@@ -442,7 +456,7 @@ ${allFree
         }
       }
 
-      // 3) rollback
+      // rollback
       if (failed && bookedDates.length) {
         for (const date of bookedDates.reverse()) { await gsPostCancel(date, who).catch(() => {}); }
       }
@@ -480,7 +494,7 @@ ${instr}`;
 
     // pokud dotaz je o parkování, ale nebyl rozpoznán rozsah → popros o formát
     if (intent === "parking") {
-      const ask = parseDatesStrict(lastUserText).ask;
+      const ask = parseDatesStrict(lastUser).ask;
       return ok(ask || "Napište prosím termín parkování ve formátu **DD.MM.–DD.MM.YYYY**.");
     }
 
