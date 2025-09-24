@@ -1,7 +1,7 @@
 // netlify/functions/chat.js
 
 const TRANSLATE_INSTRUCTIONS = true;
-const VERSION = "chatjs-2025-09-24-langflow-v2";
+const VERSION = "chatjs-2025-09-24-langflow-v3";
 
 export default async (req) => {
   const ok = (reply) =>
@@ -41,8 +41,6 @@ export default async (req) => {
     // ---------- Utils: messages ----------
     const lastUserText = () => [...messages].reverse().find(m=>m.role==='user')?.content || '';
     const userCount = messages.filter(m=>m.role==='user').length;
-    const assistantCount = messages.filter(m=>m.role==='assistant').length;
-    const isFirstUserTurn = userCount === 1; // UI úvodní bublina nevadí
 
     // ---------- Language handling ----------
     const SUPPORTED = { cs: "Čeština", en: "English", de: "Deutsch", es: "Español" };
@@ -55,12 +53,20 @@ export default async (req) => {
       }
       return null;
     }
+    function hasAskedLang(msgs){
+      return msgs.some(m => /⟦asklang⟧/.test(String(m?.content || "")));
+    }
     function wantsLanguage(text){
-      const t = (text||"").toLowerCase();
-      if (/(čeština|cestina|česky|cz|cs)\b/.test(t)) return "cs";
-      if (/\ben(glish)?\b|\ben\b/.test(t)) return "en";
-      if (/\bespañol|\bes\b|span(ish)?/.test(t)) return "es";
-      if (/\bdeutsch|\bger(man)?|\bde\b/.test(t)) return "de";
+      const t = (text||"").trim().toLowerCase();
+      if (/^(cs|cz|čeština|cestina|česky)$/.test(t)) return "cs";
+      if (/^(en|eng|english)$/.test(t)) return "en";
+      if (/^(es|esp|español|spanish)$/.test(t)) return "es";
+      if (/^(de|ger|deutsch|german)$/.test(t)) return "de";
+      // tolerantní zachycení vět
+      if (/(čeština|cestina|česky)/.test(t)) return "cs";
+      if (/\benglish\b/.test(t)) return "en";
+      if (/\bespañol|spanish\b/.test(t)) return "es";
+      if (/\bdeutsch|german\b/.test(t)) return "de";
       return null;
     }
     async function callOpenAI(msgs){
@@ -207,7 +213,7 @@ ${fullInstructionsEN()}`; }
       for (let i=msgs.length-1;i>=0;i--){
         const m = msgs[i];
         if (!m || !m.content) continue;
-        const mm = /Dostupnost pro \*\*(\d{4}-\d{2}-\d{2})\s*→\s*(\d{4}-\d{2}-\d{2})\*\*/.exec(String(m.content));
+        const mm = /Dostupnost pro \*\*(\d{4}-\d{2}-\d{2})\s*→\s*(\d{4}-\d{2}-\d2)\*\*/.exec(String(m.content));
         if (mm) return { from:mm[1], to:mm[2] };
       }
       return null;
@@ -257,29 +263,29 @@ ${fullInstructionsEN()}`; }
     const userText = lastUserText();
     let chosenLang = getChosenLangFromHistory(messages);
     const requestedLang = wantsLanguage(userText);
+    const askedBefore = hasAskedLang(messages);
 
-    // a) První uživatelova zpráva → nabídni výběr jazyka
-    if (!chosenLang && isFirstUserTurn) {
-      return ok(LangQuestionEN);
-    }
-
-    // b) Uživatel explicitně řekne jazyk (nebo během chatu požádá o přepnutí)
+    // 1) Pokud uživatel jasně napsal jazyk → PŘEPNI HNED + pošli onboarding (v jedné odpovědi)
     if (requestedLang && requestedLang !== chosenLang) {
       chosenLang = requestedLang;
       const bundleEN = onboardingForLang();
       const onboardingTranslated = await translateTo(bundleEN, chosenLang);
-      // V JEDNÉ odpovědi: marker + potvrzení + celé instrukce
       const confirm = await translateTo("Language switched.", chosenLang);
       return ok(`⟦lang:${chosenLang}⟧\n${confirm}\n\n${onboardingTranslated}`);
     }
 
-    // c) Pokud stále není jazyk (uživatel odepsal něčím nejasným), nastav heuriticky a pošli onboarding
-    if (!chosenLang) {
-      chosenLang = /[ěščřžýáíéůúĚŠČŘŽÝÁÍÉŮÚ]|češtin|česky|cz|cs/i.test(userText) ? "cs" : "en";
+    // 2) Není zvolen jazyk a ještě jsme se neptali → pošli JEDNOU dotaz (s markerem)
+    if (!chosenLang && !askedBefore) {
+      return ok(`⟦asklang⟧\n${LangQuestionEN}`);
+    }
+
+    // 3) Po dotazu uživatel odpověděl něčím nejasným → nastav heuristicky a pošli onboarding
+    if (!chosenLang && askedBefore) {
+      const guess = /[ěščřžýáíéůúĚŠČŘŽÝÁÍÉŮÚ]|češtin|česky|cz|cs/i.test(userText) ? "cs" : "en";
       const bundleEN = onboardingForLang();
-      const onboardingTranslated = await translateTo(bundleEN, chosenLang);
-      const note = await translateTo("Okay, I will continue in this language.", chosenLang);
-      return ok(`⟦lang:${chosenLang}⟧\n${note}\n\n${onboardingTranslated}`);
+      const onboardingTranslated = await translateTo(bundleEN, guess);
+      const note = await translateTo("Okay, I will continue in this language.", guess);
+      return ok(`⟦lang:${guess}⟧\n${note}\n\n${onboardingTranslated}`);
     }
 
     // ---------- Router (all replies translated to chosenLang) ----------
@@ -291,7 +297,7 @@ ${fullInstructionsEN()}`; }
     }
 
     // ---------- PARKING FLOW ----------
-    // helpers to extract details
+    // ... (zbytek je stejný jako v tvé verzi v2, vše proháníme přes translateTo(..., chosenLang))
     function extractArrivalDateTime(text) {
       const t = (text || "").trim();
       const reDT = /\b(\d{2})\.(\d{2})\.(\d{4})(?:[ T]+(\d{1,2})[:.](\d{2}))?\b/;
@@ -351,13 +357,11 @@ ${fullInstructionsEN()}`; }
     let parsed  = parseDatesStrict(userText);
     let effectiveRange = derived || parsed.confirmed || rangeFromHistory(messages);
 
-    // a) Nemáme rozsah → ptej se na termín (v jazyce)
     if (intent === "parking" && !effectiveRange) {
       const ask = parsed.ask || "Napište prosím termín parkování ve formátu **DD.MM.–DD.MM.YYYY**.";
       return ok(await translateTo(ask, chosenLang));
     }
 
-    // b) Máme rozsah → načti dostupnost
     let AV = null;
     if (intent === "parking" && effectiveRange) {
       const { from, to } = effectiveRange;
@@ -390,7 +394,6 @@ ${allFree
       AV = { from, to, nights: out.length, days: out, allKnown, allFree, anyFull, text: await translateTo(baseText, chosenLang) };
     }
 
-    // c) Máme dostupnost → vyžádej chybějící detaily
     const details = extractDetailsFromFreeText();
     function missingDetailsPrompt(details){
       const need = [];
@@ -410,17 +413,14 @@ ${allFree
       }
     }
 
-    // d) Máme vše → zápis
     if (intent === "parking" && AV && AV.allKnown && AV.nights>0 && details && details.guest_name && details.car_plate) {
       const who = `${details.guest_name} / ${details.car_plate}`.trim();
       const bookedDates = []; let failed=null;
 
-      // re-check
       for (const d of AV.days){
         const check = await gsGetParking(d.date);
         if (!check?.ok || (Number(check.free)||0) <= 0){ failed = { date:d.date, reason:'No free spot' }; break; }
       }
-      // book
       if (!failed){
         for (const d of AV.days){
           const res = await gsPostBook(d.date, who, details.arrival_time || '');
@@ -428,7 +428,6 @@ ${allFree
           bookedDates.push(d.date);
         }
       }
-      // rollback
       if (failed && bookedDates.length){
         for (const date of bookedDates.reverse()){ await gsPostCancel(date, who).catch(()=>{}); }
       }
@@ -464,12 +463,10 @@ ${instr}`;
       }
     }
 
-    // fallback parking – jen dostupnost
     if (intent === "parking" && AV) {
       return ok(AV.text);
     }
 
-    // generic fallback
     return ok(await translateTo("How can I help you further? (Wi-Fi, taxi, parking, AC, power…)", chosenLang));
 
   } catch (err) {
