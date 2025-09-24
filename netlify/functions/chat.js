@@ -26,8 +26,9 @@ export default async (req) => {
       return userErr('Server: chybí PARKING_API_URL. Nastav v Netlify na URL Apps Script WebApp (končící na /exec).');
     }
 
-    // ---------- Public data ----------
+    // ---------- Public base ----------
     const base = new URL(req.url);
+    const IMG  = (p) => new URL(p, base.origin).toString();
 
     // ---------- Utils: messages ----------
     const lastUserText = () => [...messages].reverse().find(m=>m.role==='user')?.content || '';
@@ -38,14 +39,12 @@ export default async (req) => {
     const SUPPORTED = { cs: "Čeština", en: "English", de: "Deutsch", es: "Español" };
 
     function detectLangFromAssistant(msgs){
-      // vezmeme jazyk poslední asistentovy „delší“ zprávy
       for (let i=msgs.length-1;i>=0;i--){
-        const m = msgs[i];
-        if (m?.role !== 'assistant') continue;
+        const m = msgs[i]; if (m?.role !== 'assistant') continue;
         const t = (m.content||'').toLowerCase();
-        if (/[ěščřžýáíéůúĚŠČŘŽÝÁÍÉŮÚ]/.test(t) || /čes|češt|bagáž|pokoj/i.test(t)) return "cs";
+        if (/[ěščřžýáíéůúĚŠČŘŽÝÁÍÉŮÚ]/.test(t) || /čes|češt|bagáž|pokoj/.test(t)) return "cs";
         if (/\bder\b|\bund\b|straße|\bdeutsch\b/.test(t)) return "de";
-        if (/\bel \b|la |¿|¡|\bespañol|estacionamiento/.test(t)) return "es";
+        if (/\bel \b| la |\b¿|¡|\bespañol|estacionamiento/.test(t)) return "es";
         if (t) return "en";
       }
       return null;
@@ -109,22 +108,24 @@ If you’d like this service, please tell me your **flight number** and **exact 
 
 **Self check-in — step by step**
 1) **Open the gate** — dial **3142#** on the left wall.  
-   ![Gate keypad](/img/gate.jpg)
+   ![Gate keypad](${IMG('/img/gate.jpg')})
 
 2) **Luggage room** (if you arrive before check-in) — next to the key box, **same code 3142#**.  
-   ![Luggage room door](/img/luggage.jpg)
+   ![Luggage room door](${IMG('/img/luggage.jpg')})
 
 3) **Key box location** — the **white key box** is in the passage to the courtyard, right after the gate.  
-   ![Key box](/img/keybox.jpg)
+   ![Key box location](${IMG('/img/keybox.jpg')})
 
 4) **Apartment key box code** — the **code will be sent by David** before arrival.  
    *(Do not store your key in the box during your stay.)*
+   ![Self check-out/key drop box](${IMG('/img/12. Box_self-check-out.jpg')})
 
 5) **Main entrance chip** — the chip opens the **main door** on the right side of the parking area; it also opens the **gate** via the sensor next to the dial box.  
-   ![Gate sensor](/img/sensor.jpg)
+   ![Main entrance](${IMG('/img/11. Main-entrance.jpg')})
+   ![Gate sensor](${IMG('/img/sensor.jpg')})
 
 6) **Gate from inside** — use the **white switch** next to the key box; it **closes automatically** in **2.5 minutes**.  
-   ![Parking entry](/img/parking-entry.jpg)
+   ![Parking entry](${IMG('/img/parking-entry.jpg')})
 
 7) **Apartment number** — **David will send your apartment number** before arrival.
 
@@ -135,7 +136,8 @@ Wi-Fi name & password are on the **bottom of the router**. The TV has **no chann
 Mode **Sun** heats, **Snowflake** cools.
 
 **Check-out**
-Check-out is **before 11:00 a.m.** Drop the key into the **white postal box** on the ground floor, opposite the elevator (inside).
+Check-out is **before 11:00 a.m.** Drop the key into the **white postal box** on the ground floor, opposite the elevator (inside).  
+![Self check-out/key drop box](${IMG('/img/12. Box_self-check-out.jpg')})
 
 **House rules**
 All rooms are **strictly non-smoking** (fine **100 EUR**). Balconies on all floors + courtyard available. No **open fire** in the apartment.
@@ -151,7 +153,7 @@ _All information is also in your room (blue frame)._
     function saysOneNight(text){ return /(1\s*noc|jednu\s*noc|one\s*night)/i.test(text||''); }
     function detectIntent(text){
       const t = text || '';
-      const hasRange = /(\d{2})\.(\d{2})\.\s*[–-]\s*(\d{2})\.(\d{2})\.(\d{4})/.test(t);
+      const hasRange  = /(\d{2})\.(\d{2})\.\s*[–-]\s*(\d{2})\.(\d{2})\.(\d{4})/.test(t);
       const hasSingle = /\b(\d{2})\.(\d{2})\.(\d{4})\b/.test(t);
       if (hasRange || hasSingle || wantsParking(t) || saysOneNight(t)) return "parking";
       if (/(wifi|wi-?fi|internet)/i.test(t)) return "wifi";
@@ -190,8 +192,7 @@ _All information is also in your room (blue frame)._
 
     function parseSingleDateAsOneNight(text){
       const t = (text||'').trim();
-      // vyřadíme případy, kde už je rozsah s pomlčkou
-      if (/[–-]/.test(t)) return null;
+      if (/[–-]/.test(t)) return null; // už je to rozsah
       const m = /\b(\d{2})\.(\d{2})\.(\d{4})\b/.exec(t);
       if (!m) return null;
       const d = clamp(+m[3], +m[2], +m[1]);
@@ -257,18 +258,18 @@ _All information is also in your room (blue frame)._
     const userText = lastUserText();
     let chosenLang = wantsLanguage(userText) || detectLangFromAssistant(messages);
 
-    // 1) Je to úplně první interakce a zatím není jazyk → polož otázku na jazyk
+    // první interakce → zeptat se na jazyk
     if (!chosenLang && userCount === 1 && assistantCount === 0) {
       return ok(LangQuestionEN);
     }
-    // 2) Stále není jazyk? Zvol heuristicky a pošli onboarding
+    // fallback výběru jazyka + onboarding
     if (!chosenLang) {
       chosenLang = /[ěščřžýáíéůúĚŠČŘŽÝÁÍÉŮÚ]|češtin|česky|cz|cs/i.test(userText) ? "cs" : "en";
       const onboardingTranslated = await translateTo(onboardingEN(), chosenLang);
       const note = await translateTo("Okay, I will continue in this language.", chosenLang);
       return ok(`${note}\n\n${onboardingTranslated}`);
     }
-    // 3) Pokud právě přišla explicitní volba jazyka → pošli onboarding rovnou
+    // explicitní přepnutí jazyka
     const explicitLang = wantsLanguage(userText);
     if (explicitLang) {
       chosenLang = explicitLang;
@@ -276,12 +277,11 @@ _All information is also in your room (blue frame)._
       return ok(onboardingTranslated);
     }
 
-    // ---------- Router (all replies translated to chosenLang) ----------
+    // ---------- Router ----------
     const intent = detectIntent(userText);
     const priorRange = rangeFromHistory(messages);
-    const activeParking = intent === "parking" || !!priorRange; // pokračujeme i bez klíčového slova
+    const activeParking = intent === "parking" || !!priorRange;
 
-    // Stručná pomoc pro jiné intenty
     if (!activeParking && intent !== "unknown") {
       return ok(await translateTo("How can I help you further? (Wi-Fi, taxi, parking, AC, power…)", chosenLang));
     }
@@ -326,16 +326,21 @@ _All information is also in your room (blue frame)._
       const timeMatch = t.match(/(\b\d{1,2}[:.]\d{2}\b)/);
       const arrival = timeMatch ? timeMatch[1].replace(".", ":") : null;
       const parts = t.split(/[,;\n]/).map((s) => s.trim()).filter(Boolean);
+
+      // tolerantní SPZ: povolí mezery a pomlčky, normalizuje na bez mezer
       let plate = null;
       for (const p of parts) {
-        const c = p.replace(/\s+/g, "");
-        if (/^[A-Za-z0-9-]{5,}$/.test(c)) { plate = c.toUpperCase(); break; }
+        if (/^[A-Za-z0-9 -]{5,}$/.test(p)) {
+          const normalized = p.replace(/\s+/g,'').toUpperCase();
+          if (/^[A-Z0-9-]{5,}$/.test(normalized)) { plate = normalized; break; }
+        }
       }
+
       let name = null;
       for (const p of parts) {
         const clean = p.replace(/\s+/g, " ").trim();
         if (arrival && clean.includes(arrival)) continue;
-        if (plate && clean.replace(/\s+/g, "").toUpperCase() === plate) continue;
+        if (plate && clean.replace(/\s+/g,'').toUpperCase() === plate) continue;
         if (clean.length >= 3) { name = clean; break; }
       }
       if (!name && !plate && !arrival) return null;
@@ -348,7 +353,6 @@ _All information is also in your room (blue frame)._
     let effectiveRange = derived || singleRange || parsedRange.confirmed || priorRange;
 
     if (activeParking && !effectiveRange) {
-      // Už onboarding se ptal na příjezd; tady chceme jen termín parkování (když ještě není)
       const ask = parsedRange.ask || "Napište prosím termín parkování ve formátu **DD.MM.–DD.MM.YYYY** (např. **20.09.–24.09.2025**), nebo napište **jedno datum** pro 1 noc (např. **28.09.2025**).";
       return ok(await translateTo(ask, chosenLang));
     }
@@ -439,11 +443,13 @@ ${allFree
 **Úschova zavazadel**
 - **Před 14:00** — uložte zavazadla do **bagážovny**.
 - **Po check-outu (11:00)** — bagážovna je k dispozici.
-![Gate keypad](/img/gate.jpg)
-![Key box](/img/keybox.jpg)
-![Luggage room door](/img/luggage.jpg)
-![Gate sensor](/img/sensor.jpg)
-![Parking entry](/img/parking-entry.jpg)`.trim();
+![Gate keypad](${IMG('/img/gate.jpg')})
+![Key box](${IMG('/img/keybox.jpg')})
+![Luggage room door](${IMG('/img/luggage.jpg')})
+![Main entrance](${IMG('/img/11. Main-entrance.jpg')})
+![Gate sensor](${IMG('/img/sensor.jpg')})
+![Parking entry](${IMG('/img/parking-entry.jpg')})
+![Self check-out/key drop box](${IMG('/img/12. Box_self-check-out.jpg')})`.trim();
 
         const instr = await translateTo(packCS, chosenLang);
         const confirmEN =
