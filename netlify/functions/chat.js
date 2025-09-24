@@ -108,23 +108,22 @@ If you’d like this service, please tell me your **flight number** and **exact 
 
 **Self check-in — step by step**
 1) **Open the gate** — dial **3142#** on the left wall.  
-   ![Gate keypad](${IMG('/img/gate.jpg')})
+   ![Gate dialer](${IMG('/img/9. Dialer.jpg')})
 
 2) **Luggage room** (if you arrive before check-in) — next to the key box, **same code 3142#**.  
-   ![Luggage room door](${IMG('/img/luggage.jpg')})
+   ![Luggage room](${IMG('/img/13. Luggage room.jpg')})
 
 3) **Key box location** — the **white key box** is in the passage to the courtyard, right after the gate.  
-   ![Key box](${IMG('/img/keybox.jpg')})
+   ![Key box](${IMG('/img/10. Key-box.jpg')})
 
 4) **Apartment key box code** — **David will send the code** before arrival.  
    *(Do not store your key in the box during your stay.)*
 
 5) **Main entrance chip** — the chip opens the **main door** on the right side of the parking area; it also opens the **gate** via the sensor next to the dial pad.  
    ![Main entrance](${IMG('/img/11. Main-entrance.jpg')})
-   ![Gate sensor](${IMG('/img/sensor.jpg')})
 
 6) **Gate from inside** — use the **white switch** next to the key box; it **closes automatically** in **2.5 minutes**.  
-   ![Parking entry](${IMG('/img/parking-entry.jpg')})
+   ![Entrance / gate](${IMG('/img/6.Entrance.jpg')})
 
 7) **Apartment number** — **David will send your apartment number** before arrival.
 
@@ -323,7 +322,7 @@ _All information is also in your room (blue frame)._
       const t = lastUserText().trim();
       if (!t) return null;
       const timeMatch = t.match(/(\b\d{1,2}[:.]\d{2}\b)/);
-      const arrival = timeMatch ? t.match(/(\b\d{1,2}[:.]\d{2}\b)/)[0].replace(".", ":") : null;
+      const arrival = timeMatch ? timeMatch[1].replace(".", ":") : null;
       const parts = t.split(/[,;\n]/).map((s) => s.trim()).filter(Boolean);
 
       // tolerantní SPZ: povolí mezery a pomlčky, normalizuje na bez mezer
@@ -443,12 +442,11 @@ ${allFree
 - **Před 14:00** — uložte zavazadla do **bagážovny**.
 - **Po check-outu (11:00)** — bagážovna je k dispozici.
 
-![Gate keypad](${IMG('/img/gate.jpg')})
-![Key box](${IMG('/img/keybox.jpg')})
-![Luggage room door](${IMG('/img/luggage.jpg')})
+![Gate dialer](${IMG('/img/9. Dialer.jpg')})
+![Key box](${IMG('/img/10. Key-box.jpg')})
+![Luggage room](${IMG('/img/13. Luggage room.jpg')})
 ![Main entrance](${IMG('/img/11. Main-entrance.jpg')})
-![Gate sensor](${IMG('/img/sensor.jpg')})
-![Parking entry](${IMG('/img/parking-entry.jpg')})
+![Entrance / gate](${IMG('/img/6.Entrance.jpg')})
 ![Self check-out/key drop box](${IMG('/img/12. Box_self-check-out.jpg')})`.trim();
 
         const instr = await translateTo(packCS, chosenLang);
