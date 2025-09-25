@@ -2,7 +2,7 @@
 
 const TRANSLATE_INSTRUCTIONS = true;
 
-// --- tiny helper: Promise.race timeout wrapper for fetch ---
+/** Promise.race timeout wrapper */
 async function withTimeout(promise, ms, label = "request") {
   let t;
   const timeout = new Promise((_, rej) => {
@@ -77,31 +77,39 @@ export default async (req) => {
       if (/\bdeutsch|german\b/.test(t)) return "de";
       return null;
     }
-    async function callOpenAI(msgs){
-      // Fallback bez API klíče: vrať prostě vstup uživatele → žádné pády
-      if (!OPENAI_API_KEY) return msgs.find(m=>m.role==='user')?.content || '';
-      const r = await withTimeout(
-        fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ model: "gpt-4o-mini", messages: msgs, temperature: 0.2 })
-        }),
-        12000,
-        "OpenAI translate"
-      );
-      const txt = await r.text();
-      if (!r.ok) return `Translator error ${r.status}: ${txt}`;
-      try { const data = JSON.parse(txt); return data.choices?.[0]?.message?.content || ''; }
-      catch { return `Translator bad json: ${txt}`; }
-    }
-    async function translateTo(text, lang){
+
+    /** Safe translator with retry + never throws; returns English on failure */
+    async function translateSafe(text, lang) {
       if (!TRANSLATE_INSTRUCTIONS || !lang || lang === "en") return text;
-      const msgs = [
-        { role: "system", content: `Translate the following text to ${SUPPORTED[lang]}. Keep formatting and meaning. Return only the translated text.` },
-        { role: "user", content: text }
-      ];
-      const out = await callOpenAI(msgs);
-      return out || text;
+      if (!OPENAI_API_KEY) return text; // fallback: bez překladu
+      const payload = {
+        method: "POST",
+        headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          messages: [
+            { role: "system", content: `Translate the following text to ${SUPPORTED[lang]}. Keep formatting and meaning. Return only the translated text.` },
+            { role: "user", content: text }
+          ],
+          temperature: 0.2
+        })
+      };
+
+      const attempt = async (i) => {
+        try {
+          const r = await withTimeout(fetch("https://api.openai.com/v1/chat/completions", payload), 8000 + i*4000, "OpenAI translate");
+          const txt = await r.text();
+          if (!r.ok) return null;
+          try {
+            const data = JSON.parse(txt);
+            return data.choices?.[0]?.message?.content || null;
+          } catch { return null; }
+        } catch { return null; }
+      };
+
+      let out = await attempt(0);
+      if (out == null) out = await attempt(1); // 2. pokus
+      return out || text; // když nic, vrať anglicky
     }
 
     // ---------- Static texts (EN source) ----------
@@ -222,7 +230,6 @@ _All information is also in your room (blue frame)._
     }
 
     function rangeFromHistory(msgs){
-      // Povol i verzi bez tučných ** i bez češtiny/angličtiny
       const patterns = [
         /Dostupnost pro\s+\**(\d{4}-\d{2}-\d{2})\s*→\s*(\d{4}-\d{2}-\d{2})\**/i,
         /Availability for\s+\**(\d{4}-\d{2}-\d{2})\s*→\s*(\d{4}-\d{2}-\d{2})\**/i
@@ -285,15 +292,15 @@ _All information is also in your room (blue frame)._
     // fallback výběru jazyka + onboarding
     if (!chosenLang) {
       chosenLang = /[ěščřžýáíéůúĚŠČŘŽÝÁÍÉŮÚ]|češtin|česky|cz|cs/i.test(userText) ? "cs" : "en";
-      const onboardingTranslated = await translateTo(onboardingEN(), chosenLang);
-      const note = await translateTo("Okay, I will continue in this language.", chosenLang);
+      const onboardingTranslated = await translateSafe(onboardingEN(), chosenLang);
+      const note = await translateSafe("Okay, I will continue in this language.", chosenLang);
       return ok(`${note}\n\n${onboardingTranslated}`);
     }
     // explicitní přepnutí jazyka
     const explicitLang = wantsLanguage(userText);
     if (explicitLang) {
       chosenLang = explicitLang;
-      const onboardingTranslated = await translateTo(onboardingEN(), chosenLang);
+      const onboardingTranslated = await translateSafe(onboardingEN(), chosenLang);
       return ok(onboardingTranslated);
     }
 
@@ -303,7 +310,7 @@ _All information is also in your room (blue frame)._
     const activeParking = intent === "parking" || !!priorRange;
 
     if (!activeParking && intent !== "unknown") {
-      return ok(await translateTo("How can I help you further? (Wi-Fi, taxi, parking, AC, power…)", chosenLang));
+      return ok(await translateSafe("How can I help you further? (Wi-Fi, taxi, parking, AC, power…)", chosenLang));
     }
 
     // ---------- PARKING FLOW ----------
@@ -374,7 +381,7 @@ _All information is also in your room (blue frame)._
 
     if (activeParking && !effectiveRange) {
       const ask = parsedRange.ask || "Napište prosím termín parkování ve formátu **DD.MM.–DD.MM.YYYY** (např. **20.09.–24.09.2025**), nebo napište **jedno datum** pro 1 noc (např. **28.09.2025**).";
-      return ok(await translateTo(ask, chosenLang));
+      return ok(await translateSafe(ask, chosenLang));
     }
 
     let AV = null;
@@ -405,7 +412,7 @@ ${allFree
     ? "\nSome nights are full. We can look for another date or suggest alternatives (mrparkit.com)."
     : "\nSome days are unknown; availability needs manual confirmation."}`;
 
-      const baseText = await translateTo(baseTextEN, chosenLang);
+      const baseText = await translateSafe(baseTextEN, chosenLang);
       AV = { from, to, nights: out.length, days: out, allKnown, allFree, anyFull, text: baseText };
     }
 
@@ -422,7 +429,7 @@ ${allFree
     if (activeParking && AV) {
       const need = missingDetailsPrompt(details);
       if (need) {
-        return ok(`${AV.text}\n\n${await translateTo(need, chosenLang)}`);
+        return ok(`${AV.text}\n\n${await translateSafe(need, chosenLang)}`);
       }
     }
 
@@ -471,17 +478,17 @@ ${allFree
 ![Entrance / gate](${IMG('/img/6.Entrance.jpg')})
 ![Self check-out/key drop box](${IMG('/img/12. Box_self-check-out.jpg')})`.trim();
 
-        const instr = await translateTo(packCS, chosenLang);
+        const instr = await translateSafe(packCS, chosenLang);
         const confirmEN =
 `✅ Parking reservation saved (${AV.nights} night${AV.nights>1?'s':''}):
 ${list}
 Guest: ${details.guest_name}, Plate: ${details.car_plate}, Arrival: ${details.arrival_time || 'n/a'}
 
 ${instr}`;
-        return ok(await translateTo(confirmEN, chosenLang));
+        return ok(await translateSafe(confirmEN, chosenLang));
       } else {
         const why = failed.reason + (failed.raw ? `\nRaw: ${String(failed.raw).slice(0,300)}` : '');
-        return userErr(await translateTo(`Failed to save reservation for ${failed.date}: ${why}\nPlease try again or specify another date.`, chosenLang));
+        return userErr(await translateSafe(`Failed to save reservation for ${failed.date}: ${why}\nPlease try again or specify another date.`, chosenLang));
       }
     }
 
@@ -489,10 +496,10 @@ ${instr}`;
       return ok(AV.text);
     }
 
-    return ok(await translateTo("How can I help you further? (Wi-Fi, taxi, parking, AC, power…)", chosenLang));
+    return ok(await translateSafe("How can I help you further? (Wi-Fi, taxi, parking, AC, power…)", chosenLang));
 
   } catch (err) {
-    // Posílejme vždy 200 + text (ať frontend nikdy nespadne do catch)
+    // vždy 200 + text, aby frontend nikdy nespadl do catch
     return new Response(JSON.stringify({ reply: `⚠️ Server error (chat.js): ${String(err)}` }), {
       status: 200, headers: { "content-type": "application/json" }
     });
