@@ -3,39 +3,36 @@ import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 
 export default function App(){
-  // Začínáme BEZ statické uvítací bubliny
   const [chat, setChat] = useState([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const scrollerRef = useRef(null)
 
-  // scroll na konec po každé změně chatu
   useEffect(() => { scrollerRef.current?.scrollTo(0, 9_999_999) }, [chat])
 
-  // === AUTO-ONBOARDING ===
-  // Po načtení appky pošli syntetickou první USER zprávu,
-  // tím backend vrátí správný onboarding (CZ/EN dle vzorku).
+  // bootstrap – pošli syntetického usera
   useEffect(() => {
-    // pokud už něco v chatu je, nic nedělej (obnova stránky apod.)
     if (chat.length > 0) return
     const bootstrap = async () => {
       setLoading(true)
-      const firstMessages = [{ role: 'user', content: 'Hello' }] // CZ vzorek pro překlad
+      const firstMessages = [{ role: 'user', content: 'Hello' }]
       try{
         const r = await fetch('/.netlify/functions/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ messages: firstMessages })
         })
-        if(!r.ok){
+        let data
+        try {
+          data = await r.json()
+        } catch {
           const txt = await r.text()
-          throw new Error(txt || `HTTP ${r.status}`)
+          data = { reply: txt || '⚠️ Bad response' }
         }
-        const data = await r.json()
         setChat([{ role: 'assistant', content: data.reply }])
       }catch(e){
-        console.error(e)
-        setChat([{ role: 'assistant', content: 'Omlouvám se, něco se pokazilo při načítání. Zkuste to prosím znovu.' }])
+        console.error('bootstrap error', e)
+        setChat([{ role: 'assistant', content: '⚠️ Nelze se připojit k serveru. Zkuste prosím znovu.' }])
       }finally{
         setLoading(false)
       }
@@ -54,21 +51,23 @@ export default function App(){
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messages: next })
       })
-      if(!r.ok){
+      // NEHÁZEJ při !r.ok – vždy se snaž zobrazit, co přišlo
+      let data
+      try {
+        data = await r.json()
+      } catch {
         const txt = await r.text()
-        throw new Error(txt || `HTTP ${r.status}`)
+        data = { reply: txt || `⚠️ Server returned status ${r.status}` }
       }
-      const data = await r.json()
       setChat([...next, { role: 'assistant', content: data.reply }])
     }catch(e){
-      console.error(e)
-      setChat([...next, { role: 'assistant', content: 'Omlouvám se, něco se pokazilo. Zkuste to prosím znovu.' }])
+      console.error('send error', e)
+      setChat([...next, { role: 'assistant', content: '⚠️ Nelze se připojit k serveru. Zkuste to prosím znovu.' }])
     }finally{
       setLoading(false)
     }
   }
 
-  // převod Markdown → bezpečné HTML
   function renderAssistant(md = ''){
     const rawHtml = marked.parse(md, { breaks: true })
     const safeHtml = DOMPurify.sanitize(rawHtml)

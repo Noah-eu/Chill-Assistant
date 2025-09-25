@@ -2,6 +2,22 @@
 
 const TRANSLATE_INSTRUCTIONS = true;
 
+// --- tiny helper: Promise.race timeout wrapper for fetch ---
+async function withTimeout(promise, ms, label = "request") {
+  let t;
+  const timeout = new Promise((_, rej) => {
+    t = setTimeout(() => rej(new Error(`${label} timeout after ${ms}ms`)), ms);
+  });
+  try {
+    const res = await Promise.race([promise, timeout]);
+    clearTimeout(t);
+    return res;
+  } catch (e) {
+    clearTimeout(t);
+    throw e;
+  }
+}
+
 export default async (req) => {
   const ok = (reply) =>
     new Response(JSON.stringify({ reply }), {
@@ -15,7 +31,7 @@ export default async (req) => {
 
     // ---------- BODY ----------
     let body = {};
-    try { body = await req.json(); } catch { return new Response("Bad JSON body", { status: 400 }); }
+    try { body = await req.json(); } catch { return new Response(JSON.stringify({ reply: "⚠️ Bad JSON body" }), { status: 200 }); }
     const { messages = [] } = body;
 
     // ---------- ENV ----------
@@ -62,12 +78,17 @@ export default async (req) => {
       return null;
     }
     async function callOpenAI(msgs){
+      // Fallback bez API klíče: vrať prostě vstup uživatele → žádné pády
       if (!OPENAI_API_KEY) return msgs.find(m=>m.role==='user')?.content || '';
-      const r = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "gpt-4o-mini", messages: msgs, temperature: 0.2 })
-      });
+      const r = await withTimeout(
+        fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "gpt-4o-mini", messages: msgs, temperature: 0.2 })
+        }),
+        12000,
+        "OpenAI translate"
+      );
       const txt = await r.text();
       if (!r.ok) return `Translator error ${r.status}: ${txt}`;
       try { const data = JSON.parse(txt); return data.choices?.[0]?.message?.content || ''; }
@@ -201,9 +222,10 @@ _All information is also in your room (blue frame)._
     }
 
     function rangeFromHistory(msgs){
+      // Povol i verzi bez tučných ** i bez češtiny/angličtiny
       const patterns = [
-        /Dostupnost pro \*\*(\d{4}-\d{2}-\d{2})\s*→\s*(\d{4}-\d{2}-\d{2})\*\*/,
-        /Availability for \*\*(\d{4}-\d{2}-\d{2})\s*→\s*(\d{4}-\d{2}-\d{2})\*\*/
+        /Dostupnost pro\s+\**(\d{4}-\d{2}-\d{2})\s*→\s*(\d{4}-\d{2}-\d{2})\**/i,
+        /Availability for\s+\**(\d{4}-\d{2}-\d{2})\s*→\s*(\d{4}-\d{2}-\d{2})\**/i
       ];
       for (let i=msgs.length-1;i>=0;i--){
         const c = String(msgs[i]?.content || "");
@@ -219,7 +241,7 @@ _All information is also in your room (blue frame)._
 
     async function gsGetParking(dateISO){
       try{
-        const r = await fetch(qs({ fn:'parking', date: dateISO }), { redirect:'follow' });
+        const r = await withTimeout(fetch(qs({ fn:'parking', date: dateISO }), { redirect:'follow' }), 8000, "parking GET");
         const txt = await r.text();
         if (!r.ok) return { ok:false, error:`GET ${r.status}`, raw: txt?.slice(0,300) };
         try { return JSON.parse(txt); } catch { return { ok:false, error:'Bad JSON from GET', raw: txt?.slice(0,300) }; }
@@ -228,11 +250,11 @@ _All information is also in your room (blue frame)._
 
     async function gsPostBook(dateISO, who, note){
       try{
-        const r = await fetch(PARKING_API_URL, {
+        const r = await withTimeout(fetch(PARKING_API_URL, {
           method:'POST', redirect:'follow',
           headers:{ 'Content-Type':'application/json' },
           body: JSON.stringify({ action:'book', date:dateISO, who, note:note||'', apiKey: PARKING_WRITE_KEY || undefined })
-        });
+        }), 9000, "parking POST book");
         const txt = await r.text();
         if (!r.ok) return { ok:false, error:`POST ${r.status}`, raw: txt?.slice(0,300) };
         try { return JSON.parse(txt); } catch { return { ok:false, error:'Bad JSON from POST', raw: txt?.slice(0,300) }; }
@@ -241,11 +263,11 @@ _All information is also in your room (blue frame)._
 
     async function gsPostCancel(dateISO, who){
       try{
-        const r = await fetch(PARKING_API_URL, {
+        const r = await withTimeout(fetch(PARKING_API_URL, {
           method:'POST', redirect:'follow',
           headers:{ 'Content-Type':'application/json' },
           body: JSON.stringify({ action:'cancel', date:dateISO, who, apiKey: PARKING_WRITE_KEY || undefined })
-        });
+        }), 9000, "parking POST cancel");
         const txt = await r.text();
         if (!r.ok) return { ok:false, error:`POST ${r.status}`, raw: txt?.slice(0,300) };
         try { return JSON.parse(txt); } catch { return { ok:false, error:'Bad JSON from POST', raw: txt?.slice(0,300) }; }
@@ -325,7 +347,7 @@ _All information is also in your room (blue frame)._
       const arrival = timeMatch ? timeMatch[1].replace(".", ":") : null;
       const parts = t.split(/[,;\n]/).map((s) => s.trim()).filter(Boolean);
 
-      // tolerantní SPZ: povolí mezery a pomlčky, normalizuje na bez mezer
+      // SPZ tolerantně
       let plate = null;
       for (const p of parts) {
         if (/^[A-Za-z0-9 -]{5,}$/.test(p)) {
@@ -470,7 +492,8 @@ ${instr}`;
     return ok(await translateTo("How can I help you further? (Wi-Fi, taxi, parking, AC, power…)", chosenLang));
 
   } catch (err) {
-    return new Response(JSON.stringify({ reply: `⚠️ Server error: ${String(err)}` }), {
+    // Posílejme vždy 200 + text (ať frontend nikdy nespadne do catch)
+    return new Response(JSON.stringify({ reply: `⚠️ Server error (chat.js): ${String(err)}` }), {
       status: 200, headers: { "content-type": "application/json" }
     });
   }
